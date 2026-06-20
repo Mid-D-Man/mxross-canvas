@@ -1,0 +1,193 @@
+name: Cross-Platform Build Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Cargo profile to build"
+        required: false
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop:
+    name: Desktop / ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            label: macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.target }}
+
+      - name: Build workspace
+        shell: bash
+        run: |
+          mkdir -p results
+          PROFILE="${{ inputs.profile }}"
+          [ -z "$PROFILE" ] && PROFILE="release"
+          FLAG="--release"
+          [ "$PROFILE" = "debug" ] && FLAG=""
+          if cargo build --workspace --target ${{ matrix.target }} $FLAG 2>&1 | tee results/build.log; then
+            STATUS="success"
+          else
+            STATUS="failed"
+          fi
+          printf '{"platform":"%s","target":"%s","profile":"%s","status":"%s"}\n' \
+            "${{ matrix.label }}" "${{ matrix.target }}" "$PROFILE" "$STATUS" > results/status.json
+          [ "$STATUS" = "success" ]
+
+      - name: Upload status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: status-${{ matrix.label }}
+          path: results/status.json
+
+  android:
+    name: Android / ${{ matrix.abi }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            triple: aarch64-linux-android
+          - abi: armeabi-v7a
+            triple: armv7-linux-androideabi
+          - abi: x86_64
+            triple: x86_64-linux-android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-${{ matrix.abi }}
+
+      # ubuntu-latest ships the Android SDK + NDK preinstalled with
+      # ANDROID_NDK_HOME already exported — cargo-ndk picks it up
+      # automatically, no separate setup-ndk action needed.
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build workspace (NDK)
+        shell: bash
+        run: |
+          mkdir -p results
+          PROFILE="${{ inputs.profile }}"
+          [ -z "$PROFILE" ] && PROFILE="release"
+          FLAG="--release"
+          [ "$PROFILE" = "debug" ] && FLAG=""
+          if cargo ndk -t ${{ matrix.abi }} build --workspace $FLAG 2>&1 | tee results/build.log; then
+            STATUS="success"
+          else
+            STATUS="failed"
+          fi
+          printf '{"platform":"android-%s","target":"%s","profile":"%s","status":"%s"}\n' \
+            "${{ matrix.abi }}" "${{ matrix.triple }}" "$PROFILE" "$STATUS" > results/status.json
+          [ "$STATUS" = "success" ]
+
+      - name: Upload status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: status-android-${{ matrix.abi }}
+          path: results/status.json
+
+  ios:
+    name: iOS / ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-ios
+          - aarch64-apple-ios-sim
+          - x86_64-apple-ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ios-${{ matrix.target }}
+
+      - name: Build workspace
+        shell: bash
+        run: |
+          mkdir -p results
+          PROFILE="${{ inputs.profile }}"
+          [ -z "$PROFILE" ] && PROFILE="release"
+          FLAG="--release"
+          [ "$PROFILE" = "debug" ] && FLAG=""
+          if cargo build --workspace --target ${{ matrix.target }} $FLAG 2>&1 | tee results/build.log; then
+            STATUS="success"
+          else
+            STATUS="failed"
+          fi
+          printf '{"platform":"ios-%s","target":"%s","profile":"%s","status":"%s"}\n' \
+            "${{ matrix.target }}" "${{ matrix.target }}" "$PROFILE" "$STATUS" > results/status.json
+          [ "$STATUS" = "success" ]
+
+      - name: Upload status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: status-ios-${{ matrix.target }}
+          path: results/status.json
+
+  summary:
+    name: Build Summary
+    needs: [desktop, android, ios]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all status artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: status-*
+
+      - name: Generate summary
+        run: python3 scripts/build_summary.py --artifacts-dir artifacts >> "$GITHUB_STEP_SUMMARY"
