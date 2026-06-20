@@ -15,7 +15,10 @@ mxross-canvas-core = { path = "../mxross-canvas-core" }
 mxross-render-cpu  = { path = "../mxross-render-cpu" }
 mxross-render-core = { path = "../mxross-render-core" }
 log                = "0.4"
-env_logger         = "0.11.6"
+
+# Moved env_logger here to prevent unnecessary bloat/compilation on Android targets
+[target.'cfg(not(target_os = "android"))'.dependencies]
+env_logger = "0.11.6"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.13"
