@@ -31,7 +31,6 @@ env:
 jobs:
   desktop:
     name: Desktop / ${{ matrix.label }}
-    # Only run if 'all' or 'desktop' is selected
     if: inputs.platform == 'all' || inputs.platform == 'desktop'
     runs-on: ${{ matrix.os }}
     strategy:
@@ -101,7 +100,6 @@ jobs:
 
   android:
     name: Android / ${{ matrix.abi }}
-    # Only run if 'all' or 'android' is selected
     if: inputs.platform == 'all' || inputs.platform == 'android'
     runs-on: ubuntu-latest
     strategy:
@@ -127,10 +125,11 @@ jobs:
         with:
           key: android-${{ matrix.abi }}
 
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
+      # Required tool to build target manifests and packaging configurations
+      - name: Install cargo-apk
+        run: cargo install cargo-apk --locked
 
-      - name: Build workspace (NDK)
+      - name: Build Android APK
         shell: bash
         run: |
           mkdir -p results
@@ -138,7 +137,9 @@ jobs:
           [ -z "$PROFILE" ] && PROFILE="release"
           FLAG="--release"
           [ "$PROFILE" = "debug" ] && FLAG=""
-          if cargo ndk -t ${{ matrix.abi }} build --workspace $FLAG 2>&1 | tee results/build.log; then
+          
+          # Explicitly target your application runner crate package
+          if cargo apk build -p mxross-android --target ${{ matrix.triple }} $FLAG 2>&1 | tee results/build.log; then
             STATUS="success"
           else
             STATUS="failed"
@@ -147,16 +148,12 @@ jobs:
             "${{ matrix.abi }}" "${{ matrix.triple }}" "$PROFILE" "$STATUS" > results/status.json
           [ "$STATUS" = "success" ]
 
-      - name: Upload compiled binaries
+      - name: Upload Installable APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-android-${{ matrix.abi }}
-          path: |
-            target/${{ matrix.triple }}/release/*.so
-            target/${{ matrix.triple }}/release/*.a
-            target/${{ matrix.triple }}/debug/*.so
-            target/${{ matrix.triple }}/debug/*.a
+          name: mxross-app-android-${{ matrix.abi }}
+          path: target/${{ matrix.triple }}/*/apk/*.apk
 
       - name: Upload status
         if: always()
@@ -167,7 +164,6 @@ jobs:
 
   ios:
     name: iOS / ${{ matrix.target }}
-    # Only run if 'all' or 'ios' is selected
     if: inputs.platform == 'all' || inputs.platform == 'ios'
     runs-on: macos-latest
     strategy:
@@ -227,7 +223,6 @@ jobs:
 
   summary:
     name: Build Summary
-    # always() ensures this runs even if specific platforms were skipped
     needs: [desktop, android, ios]
     if: always()
     runs-on: ubuntu-latest
@@ -239,8 +234,7 @@ jobs:
         with:
           path: artifacts
           pattern: status-*
-          # Adding merge-multiple is good practice when downloading wildcard patterns in v4
-          merge-multiple: false 
+          merge-multiple: false
 
       - name: Generate summary
         run: python3 scripts/build_summary.py --artifacts-dir artifacts >> "$GITHUB_STEP_SUMMARY"
