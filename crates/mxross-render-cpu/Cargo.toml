@@ -1,0 +1,13 @@
+[package]
+name        = "mxross-render-cpu"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["MidManStudio"]
+description = "MxRoss Canvas CPU renderer (stub — actual rasterization pending)"
+license     = "MIT"
+
+[dependencies]
+mxross-render-core = { path = "../mxross-render-core" }
+mxross-canvas-core = { path = "../mxross-canvas-core" }
+anyhow             = "1.0"
+log                = "0.4"
