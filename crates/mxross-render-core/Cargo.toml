@@ -1,0 +1,11 @@
+[package]
+name        = "mxross-render-core"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["MidManStudio"]
+description = "Renderer trait shared by every MxRoss Canvas rendering backend"
+license     = "MIT"
+
+[dependencies]
+mxross-canvas-core = { path = "../mxross-canvas-core" }
+anyhow             = "1.0"
