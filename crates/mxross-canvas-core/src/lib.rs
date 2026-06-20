@@ -1,6 +1,16 @@
 //! Canvas and drawing data structures — no rendering logic here.
 //! (Ported from the original core-engine `canvas` module.)
-
+//! OPEN DESIGN QUESTION (not resolved yet): the canvas is moving toward an
+//! actual 3D viewport rather than a flat 2D surface — closer to how Unity's
+//! "2D mode" is really an orthographic camera in a 3D scene, or how
+//! Blender's Grease Pencil keeps stroke points in 3D space even though the
+//! result reads as 2D. Planned support for probe volumes pushes the same
+//! direction. When that lands:
+//!   - `CanvasPoint.position` likely becomes `Vec3`, not `Vec2`.
+//!   - `Canvas` likely gains a camera/viewport, not just width/height.
+//!   - `Layer` likely gains a 3D transform.
+//! Holding off on the actual change until the 2.5D-vs-3D call is made —
+//! tracked here so it doesn't get lost.
 use mxross_math::Vec2;
 use serde::{Deserialize, Serialize};
 
