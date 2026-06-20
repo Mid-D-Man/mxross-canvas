@@ -1,0 +1,18 @@
+[package]
+name    = "mxross-android"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Handles the native Android app loop and lifecycle
+android-activity = { version = "0.6", features = ["game-activity"] }
+mxross-canvas-core = { path = "../mxross-canvas-core" }
+
+# Tell cargo-apk how to package your app metadata
+[package.metadata.android]
+package = "com.midmanstudio.mxross"
+label = "MxRoss Canvas"
+build_targets = ["armv7-linux-androideabi", "aarch64-linux-android"]
