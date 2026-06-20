@@ -8,7 +8,9 @@ members = [
     "crates/mxross-document",
     "crates/mxross-brush",
     "crates/mxross-ffi",
+    "crates/mxross-android", 
 ]
+
 
 [profile.release]
 opt-level     = 3
