@@ -1,0 +1,7 @@
+[package]
+name        = "mxross-brush"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["MidManStudio"]
+description = "MxRoss Canvas brush engine — presets and stamping math, design pending"
+license     = "MIT"
