@@ -11,9 +11,10 @@ use std::time::Instant;
 pub fn init_logger() {
     #[cfg(target_os = "android")]
     {
+        // Fixed: Swapped log::Level for log::LevelFilter
         android_logger::init_once(
             android_logger::Config::default()
-                .with_max_level(log::Level::Debug)
+                .with_max_level(log::LevelFilter::Debug)
                 .with_tag("MxRossCanvas"),
         );
     }
@@ -44,4 +45,4 @@ impl Default for Timer {
     fn default() -> Self {
         Self::new()
     }
-  }
+}
