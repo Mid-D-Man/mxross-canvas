@@ -1,0 +1,10 @@
+[package]
+name        = "mxross-math"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["MidManStudio"]
+description = "Math primitives facade for MxRoss Canvas — wraps glam, swappable later"
+license     = "MIT"
+
+[dependencies]
+glam = { version = "0.25", features = ["serde"] }
