@@ -125,7 +125,6 @@ jobs:
         with:
           key: android-${{ matrix.abi }}
 
-      # Required tool to build target manifests and packaging configurations
       - name: Install cargo-apk
         run: cargo install cargo-apk --locked
 
@@ -138,12 +137,17 @@ jobs:
           FLAG="--release"
           [ "$PROFILE" = "debug" ] && FLAG=""
           
-          # Explicitly target your application runner crate package
-          if cargo apk build -p mxross-android --target ${{ matrix.triple }} $FLAG 2>&1 | tee results/build.log; then
+          # Navigate directly into the crate folder so cargo-apk matches the metadata cleanly
+          cd crates/mxross-android
+          
+          if cargo apk build --target ${{ matrix.triple }} $FLAG 2>&1 | tee ../../results/build.log; then
             STATUS="success"
           else
             STATUS="failed"
           fi
+          
+          # Go back to the root directory to generate the status matrix
+          cd ../..
           printf '{"platform":"android-%s","target":"%s","profile":"%s","status":"%s"}\n' \
             "${{ matrix.abi }}" "${{ matrix.triple }}" "$PROFILE" "$STATUS" > results/status.json
           [ "$STATUS" = "success" ]
@@ -153,6 +157,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mxross-app-android-${{ matrix.abi }}
+          # Even when running inside a crate folder, Cargo outputs artifacts to the workspace root target/ folder
           path: target/${{ matrix.triple }}/*/apk/*.apk
 
       - name: Upload status
