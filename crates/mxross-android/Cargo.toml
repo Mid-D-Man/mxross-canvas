@@ -9,10 +9,14 @@ crate-type = ["cdylib"]
 [dependencies]
 # Handles the native Android app loop and lifecycle
 android-activity = { version = "0.6", features = ["game-activity"] }
+# Link to your local workspace crate
 mxross-canvas-core = { path = "../mxross-canvas-core" }
 
-# Tell cargo-apk how to package your app metadata
+# Configuration for cargo-apk
 [package.metadata.android]
 package = "com.midmanstudio.mxross"
 label = "MxRoss Canvas"
+# These targets cover both your Samsung A13/A14 (armv7) and newer 64-bit phones (aarch64)
 build_targets = ["armv7-linux-androideabi", "aarch64-linux-android"]
+# Setting this to 33 ensures compatibility with the GitHub runner's environment
+target_sdk_version = 33
