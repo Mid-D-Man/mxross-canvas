@@ -13,7 +13,7 @@ pub fn init_logger() {
     {
         android_logger::init_once(
             android_logger::Config::default()
-                .with_min_level(log::Level::Debug)
+                .with_max_level(log::Level::Debug)
                 .with_tag("MxRossCanvas"),
         );
     }
