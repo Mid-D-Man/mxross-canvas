@@ -7,17 +7,17 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-# native-activity, not game-activity — cargo-apk has no Gradle/Maven step,
-# so it can't pull in the androidx.games:games-activity .aar that
-# game-activity depends on at runtime. NativeActivity ships in the
-# platform itself, which is exactly what cargo-apk is built around.
-android-activity   = { version = "0.6", features = ["native-activity"] }
-mxross-canvas-core = { path = "../mxross-canvas-core" }
+android-activity = { version = "0.6", features = ["native-activity"] }
+# mxross-ffi (not mxross-canvas-core directly) — reuses init_logger() and is
+# the right place for the eventual C-ABI surface too.
+mxross-ffi = { path = "../mxross-ffi" }
+# Needed explicitly so we can name HardwareBufferFormat/NativeWindow in our
+# own code — android-activity depends on the same ndk 0.9, so this resolves
+# to one shared copy in the dependency graph, not a duplicate.
+ndk = "0.9"
 
 [package.metadata.android]
 package      = "com.midmanstudio.mxross"
-# armv7 covers older/budget hardware, aarch64 covers the A13 and anything
-# newer — both genuinely relevant targets, not padding.
 build_targets = ["armv7-linux-androideabi", "aarch64-linux-android"]
 
 [package.metadata.android.sdk]
