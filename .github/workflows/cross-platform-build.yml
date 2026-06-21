@@ -99,34 +99,35 @@ jobs:
           path: results/status.json
 
   android:
-    name: Android / ${{ matrix.abi }}
+    name: Android (cargo-apk)
     if: inputs.platform == 'all' || inputs.platform == 'android'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - abi: arm64-v8a
-            triple: aarch64-linux-android
-          - abi: armeabi-v7a
-            triple: armv7-linux-androideabi
-          - abi: x86_64
-            triple: x86_64-linux-android
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.triple }}
+          targets: armv7-linux-androideabi,aarch64-linux-android
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: android-${{ matrix.abi }}
+          key: android-apk
 
       - name: Install cargo-apk
         run: cargo install cargo-apk --locked
+
+      # cargo-apk checks the exact target_sdk_version platform directory
+      # against what's actually installed under $ANDROID_HOME/platforms —
+      # there's no fallback to a nearby version, so install it explicitly
+      # rather than rely on whatever happens to ship on the runner image.
+      - name: Install required Android SDK platform
+        shell: bash
+        run: |
+          SDKMANAGER="sdkmanager"
+          command -v sdkmanager >/dev/null 2>&1 || SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --install "platforms;android-33" 2>&1 | tail -n 30
 
       - name: Build Android APK
         shell: bash
@@ -136,35 +137,39 @@ jobs:
           [ -z "$PROFILE" ] && PROFILE="release"
           FLAG="--release"
           [ "$PROFILE" = "debug" ] && FLAG=""
-          
-          # Navigate directly into the crate folder so cargo-apk matches the metadata cleanly
+
           cd crates/mxross-android
-          
-          if cargo apk build --target ${{ matrix.triple }} $FLAG 2>&1 | tee ../../results/build.log; then
+          # No --target flag here on purpose — cargo-apk always builds
+          # every triple listed in build_targets in one shot and packages
+          # them into a single multi-ABI APK.
+          if cargo apk build $FLAG 2>&1 | tee ../../results/build.log; then
             STATUS="success"
           else
             STATUS="failed"
           fi
-          
-          # Go back to the root directory to generate the status matrix
           cd ../..
-          printf '{"platform":"android-%s","target":"%s","profile":"%s","status":"%s"}\n' \
-            "${{ matrix.abi }}" "${{ matrix.triple }}" "$PROFILE" "$STATUS" > results/status.json
+
+          printf '{"platform":"android-multiarch","target":"armv7+aarch64","profile":"%s","status":"%s"}\n' \
+            "$PROFILE" "$STATUS" > results/status.json
           [ "$STATUS" = "success" ]
+
+      - name: Locate built APK (debug aid)
+        if: always()
+        shell: bash
+        run: find target -iname "*.apk" 2>/dev/null || echo "No .apk found under target/"
 
       - name: Upload Installable APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: mxross-app-android-${{ matrix.abi }}
-          # Even when running inside a crate folder, Cargo outputs artifacts to the workspace root target/ folder
-          path: target/${{ matrix.triple }}/*/apk/*.apk
+          name: mxross-app-android
+          path: target/**/apk/*.apk
 
       - name: Upload status
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: status-android-${{ matrix.abi }}
+          name: status-android
           path: results/status.json
 
   ios:
