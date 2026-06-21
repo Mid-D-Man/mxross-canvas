@@ -118,16 +118,25 @@ jobs:
       - name: Install cargo-apk
         run: cargo install cargo-apk --locked
 
-      # cargo-apk checks the exact target_sdk_version platform directory
-      # against what's actually installed under $ANDROID_HOME/platforms —
-      # there's no fallback to a nearby version, so install it explicitly
-      # rather than rely on whatever happens to ship on the runner image.
+      # Best-effort license accept, in its own step so a SIGPIPE from `yes`
+      # closing early can never fail the job — this step is never the one
+      # whose exit code we actually rely on.
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          SDKMANAGER="sdkmanager"
+          command -v sdkmanager >/dev/null 2>&1 || SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+
+      # No `yes` here and no trailing pipe — sdkmanager's own exit code is
+      # what determines pass/fail for this step, with nothing upstream or
+      # downstream in a pipe to muddy it under bash's pipefail.
       - name: Install required Android SDK platform
         shell: bash
         run: |
           SDKMANAGER="sdkmanager"
           command -v sdkmanager >/dev/null 2>&1 || SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKMANAGER" --install "platforms;android-33" 2>&1 | tail -n 30
+          "$SDKMANAGER" --install "platforms;android-33"
 
       - name: Build Android APK
         shell: bash
@@ -139,9 +148,6 @@ jobs:
           [ "$PROFILE" = "debug" ] && FLAG=""
 
           cd crates/mxross-android
-          # No --target flag here on purpose — cargo-apk always builds
-          # every triple listed in build_targets in one shot and packages
-          # them into a single multi-ABI APK.
           if cargo apk build $FLAG 2>&1 | tee ../../results/build.log; then
             STATUS="success"
           else
