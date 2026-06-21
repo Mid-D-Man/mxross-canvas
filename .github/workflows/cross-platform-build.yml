@@ -118,19 +118,26 @@ jobs:
       - name: Install cargo-apk
         run: cargo install cargo-apk --locked
 
-      # Best-effort license accept, in its own step so a SIGPIPE from `yes`
-      # closing early can never fail the job — this step is never the one
-      # whose exit code we actually rely on.
-      - name: Accept Android SDK licenses
+      # cargo-apk only auto-generates a keystore for the `dev` profile
+      # (Android's own debug-keystore convention). Every other profile
+      # name, including `release`, needs an explicit keystore — it won't
+      # invent one for you. This one is throwaway: regenerated every run,
+      # fine for installing/testing on your own device, NOT meant to be
+      # the long-term signing key for anything you intend to update
+      # build-to-build (swap to a persisted GitHub Secret for that later).
+      - name: Generate ephemeral signing keystore
         shell: bash
         run: |
-          SDKMANAGER="sdkmanager"
-          command -v sdkmanager >/dev/null 2>&1 || SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          mkdir -p "$HOME/.android"
+          keytool -genkeypair -v \
+            -keystore "$HOME/.android/mxross-ci-release.keystore" \
+            -storepass "mxross-ci" \
+            -alias mxross-ci \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=MxRoss CI, OU=MidManStudio, O=MidManStudio, L=Unknown, S=Unknown, C=US"
+          echo "CARGO_APK_RELEASE_KEYSTORE=$HOME/.android/mxross-ci-release.keystore" >> "$GITHUB_ENV"
+          echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=mxross-ci" >> "$GITHUB_ENV"
 
-      # No `yes` here and no trailing pipe — sdkmanager's own exit code is
-      # what determines pass/fail for this step, with nothing upstream or
-      # downstream in a pipe to muddy it under bash's pipefail.
       - name: Install required Android SDK platform
         shell: bash
         run: |
