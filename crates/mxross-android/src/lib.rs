@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use android_activity::{AndroidApp, InputEvent, InputStatus, MainEvent, PollEvent};
+use android_activity::{AndroidApp, InputStatus, MainEvent, PollEvent};
+use android_activity::input::InputEvent;
 use ndk::hardware_buffer_format::HardwareBufferFormat;
 use ndk::native_window::NativeWindow;
 
@@ -84,4 +85,4 @@ fn draw_frame(window: &NativeWindow, touch: Option<(f32, f32)>) {
             pixel[3].write(color[3]);
         }
     }
-    }
+}
