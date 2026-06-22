@@ -1,13 +1,12 @@
 // crates/mxross-android/src/lib.rs
 //! MxRoss Canvas — Android entry point.
 //!
-//! Replaces the original NativeWindow software pixel-buffer render loop
-//! (the "colored dot tracks your finger" test) with a real GPU path:
-//! Instance -> Surface -> Adapter -> Device, one clear-color render pass
-//! per frame. See gpu.rs for the wgpu setup and the NativeWindow/
-//! HasDisplayHandle wrapper that needed.
+//! Real GPU path: Instance -> Surface -> Adapter -> Device, one
+//! depth-tested render pass per frame drawing a hardcoded test cube. See
+//! gpu.rs for the wgpu setup and test_cube.rs for the test geometry.
 
 mod gpu;
+mod test_cube;
 
 use std::time::Duration;
 
@@ -16,7 +15,7 @@ use android_activity::{AndroidApp, InputStatus, MainEvent, PollEvent};
 use gpu::GpuState;
 
 /// Dark canvas background — same color the original software-pixel test
-/// used, so a clean GPU clear is a direct visual sanity check against it.
+/// used.
 const BACKGROUND: wgpu::Color = wgpu::Color {
     r: 30.0 / 255.0,
     g: 30.0 / 255.0,
@@ -59,7 +58,7 @@ fn android_main(app: AndroidApp) {
 
         // Draining input every tick so events don't pile up. Not wired to
         // anything yet — this is where camera orbit/pan/zoom input lands
-        // once the free 3D viewport replaces this clear-only test.
+        // once the free 3D viewport replaces this test.
         if let Ok(mut iter) = app.input_events_iter() {
             loop {
                 let has_more = iter.next(|_event| InputStatus::Unhandled);
@@ -70,7 +69,7 @@ fn android_main(app: AndroidApp) {
         }
 
         if let Some(state) = &gpu {
-            state.render_clear(BACKGROUND);
+            state.render(BACKGROUND);
         }
     }
-        }
+            }
