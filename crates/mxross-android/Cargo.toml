@@ -11,6 +11,9 @@ android-activity = { version = "0.6", features = ["native-activity"] }
 # mxross-ffi (not mxross-canvas-core directly) — reuses init_logger() and is
 # the right place for the eventual C-ABI surface too.
 mxross-ffi = { path = "../mxross-ffi" }
+# Math for the throwaway test-cube camera (perspective + look_at) — same
+# glam-backed facade the rest of the canvas pipeline uses.
+mxross-math = { path = "../mxross-math" }
 # Needed explicitly so we can name HardwareBufferFormat/NativeWindow in our
 # own code — android-activity depends on the same ndk 0.9, so this resolves
 # to one shared copy in the dependency graph, not a duplicate.
@@ -25,6 +28,8 @@ raw-window-handle = "0.6"
 # Drives wgpu's async instance/adapter/device setup synchronously inside
 # the android_main poll loop — no async runtime needed for anything else.
 pollster = "0.4"
+# Vertex/index/uniform buffer contents for the test cube.
+bytemuck = { version = "1", features = ["derive"] }
 # log::error!/log::warn! etc. — android_logger (set up by
 # mxross_ffi::init_logger) is the *backend*; this crate still needs `log`
 # itself as a direct dependency to use its macros.
