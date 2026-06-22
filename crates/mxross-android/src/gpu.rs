@@ -1,8 +1,7 @@
 // crates/mxross-android/src/gpu.rs
 //! wgpu GPU render path for MxRoss Canvas on Android — Instance -> Surface
-//! -> Adapter -> Device -> Queue, then one clear-color render pass per
-//! frame. This replaces the original NativeWindow software pixel-buffer
-//! loop now that the GPU path is confirmed end-to-end.
+//! -> Adapter -> Device -> Queue, then one depth-tested render pass per
+//! frame drawing the test cube (see test_cube.rs).
 //!
 //! ## The HasDisplayHandle gap
 //!
@@ -25,10 +24,13 @@ use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, WindowHandle,
 };
 
+use crate::test_cube::TestCube;
+
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
 /// Bundles a `NativeWindow` with the (empty) Android display handle.
 /// Takes ownership of the window — wgpu's `Surface` keeps this alive
-/// internally for as long as the surface itself lives, so nothing else
-/// needs to hold onto it.
+/// internally for as long as the surface itself lives.
 struct WindowHandles {
     native_window: NativeWindow,
 }
@@ -49,18 +51,21 @@ impl HasDisplayHandle for WindowHandles {
 /// Android `InitWindow` event and torn down on `TerminateWindow` (see
 /// lib.rs) — more churn than strictly necessary (the `Instance` in
 /// particular could outlive window swaps) but it's the simplest correct
-/// thing to ship for this first on-device GPU milestone. Revisit only if
-/// window-swap churn turns out to actually cost real frame time.
+/// thing to ship while still iterating on the render path. Revisit only
+/// if window-swap churn turns out to actually cost real frame time.
 pub struct GpuState {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    depth_view: wgpu::TextureView,
+    test_cube: TestCube,
 }
 
 impl GpuState {
     /// Builds the full Instance -> Surface -> Adapter -> Device chain for
-    /// `window` and configures the surface at its current size.
+    /// `window`, configures the surface, and creates the depth buffer +
+    /// test cube at its current size.
     pub fn new(window: NativeWindow) -> Result<Self, String> {
         pollster::block_on(Self::new_async(window))
     }
@@ -111,14 +116,30 @@ impl GpuState {
             .ok_or_else(|| "surface is not supported by this adapter".to_string())?;
         surface.configure(&device, &config);
 
-        Ok(Self { surface, device, queue, config })
+        let depth_view = Self::create_depth_view(&device, width, height);
+
+        let test_cube = TestCube::new(&device, config.format, DEPTH_FORMAT);
+        test_cube.update_camera(&queue, width as f32 / height as f32);
+
+        Ok(Self { surface, device, queue, config, depth_view, test_cube })
     }
 
-    /// Re-applies the config at a new size. Wired up to Android's
-    /// `WindowResized` event (see lib.rs) — the window itself doesn't get
-    /// torn down on resize the way it does on `TerminateWindow`, so this
-    /// is the lighter-weight path that doesn't touch the Instance/Adapter/
-    /// Device at all.
+    fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("mxross-android depth texture"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        texture.create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
+    /// Re-applies the config and rebuilds the depth buffer at a new size.
+    /// Wired up to Android's `WindowResized` event (see lib.rs).
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -126,20 +147,18 @@ impl GpuState {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        self.depth_view = Self::create_depth_view(&self.device, width, height);
+        self.test_cube.update_camera(&self.queue, width as f32 / height as f32);
     }
 
-    /// Clears the frame to `color` — the GPU-equivalent of the original
-    /// NativeWindow pixel-lock dot test's first proof point. Brush
-    /// stamping replaces this clear-only render pass once the camera and
-    /// a test primitive land.
+    /// Clears to `clear_color`, depth-tests, and draws the test cube.
     ///
     /// `Outdated`/`Lost` are deliberately just skipped for now rather than
     /// recovered from (re-configure / recreate-surface respectively) —
-    /// fine for this milestone since InitWindow already rebuilds GpuState
+    /// fine while iterating, since InitWindow already rebuilds GpuState
     /// from scratch on any real window swap; proper recovery is a later
-    /// robustness pass, not something blocking "does the clear reach the
-    /// screen on the A13".
-    pub fn render_clear(&self, color: wgpu::Color) {
+    /// robustness pass.
+    pub fn render(&self, clear_color: wgpu::Color) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -157,29 +176,38 @@ impl GpuState {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("mxross-android clear encoder"),
+                label: Some("mxross-android frame encoder"),
             });
 
         {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("mxross-android clear pass"),
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("mxross-android frame pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(color),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+
+            self.test_cube.draw(&mut pass);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
     }
-  }
+                }
