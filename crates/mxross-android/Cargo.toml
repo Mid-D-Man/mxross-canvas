@@ -15,6 +15,20 @@ mxross-ffi = { path = "../mxross-ffi" }
 # own code — android-activity depends on the same ndk 0.9, so this resolves
 # to one shared copy in the dependency graph, not a duplicate.
 ndk = "0.9"
+# GPU render path. ndk's default `rwh_06` feature and wgpu's own
+# raw-window-handle requirement both resolve to the SAME raw-window-handle
+# 0.6.x in the dependency graph (confirmed: ndk 0.9 wants ^0.6, wgpu 29.0.3
+# wants ^0.6.2) — that shared instance is what makes NativeWindow's
+# HasWindowHandle impl usable directly with wgpu below.
+wgpu = "29.0"
+raw-window-handle = "0.6"
+# Drives wgpu's async instance/adapter/device setup synchronously inside
+# the android_main poll loop — no async runtime needed for anything else.
+pollster = "0.4"
+# log::error!/log::warn! etc. — android_logger (set up by
+# mxross_ffi::init_logger) is the *backend*; this crate still needs `log`
+# itself as a direct dependency to use its macros.
+log = "0.4"
 
 [package.metadata.android]
 package      = "com.midmanstudio.mxross"
