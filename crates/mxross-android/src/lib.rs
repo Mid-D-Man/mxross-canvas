@@ -2,14 +2,19 @@
 //! MxRoss Canvas — Android entry point.
 //!
 //! Real GPU path: Instance -> Surface -> Adapter -> Device, one
-//! depth-tested render pass per frame drawing a hardcoded test cube. See
-//! gpu.rs for the wgpu setup and test_cube.rs for the test geometry.
+//! depth-tested render pass per frame drawing a hardcoded test cube from
+//! a touch-driven camera, plus an egui UI overlay (the locked-ortho/
+//! free-orbit toggle). See gpu.rs (wgpu setup), test_cube.rs (test
+//! geometry), camera.rs (camera math), ui.rs (egui integration).
 
+mod camera;
 mod gpu;
 mod test_cube;
+mod ui;
 
 use std::time::Duration;
 
+use android_activity::input::{InputEvent, MotionAction};
 use android_activity::{AndroidApp, InputStatus, MainEvent, PollEvent};
 
 use gpu::GpuState;
@@ -56,20 +61,45 @@ fn android_main(app: AndroidApp) {
             }
         });
 
-        // Draining input every tick so events don't pile up. Not wired to
-        // anything yet — this is where camera orbit/pan/zoom input lands
-        // once the free 3D viewport replaces this test.
+        // Density bucket / 160 — Android's standard DPI-scale convention
+        // (160 = mdpi = 1.0x). Cheap enough to just recompute every tick
+        // rather than caching and tracking ConfigChanged separately.
+        let pixels_per_point = app.config().density().unwrap_or(160) as f32 / 160.0;
+
+        // Single-finger touch -> both the orbit camera and egui. Only
+        // ever looks at the first pointer — no multi-touch handling yet.
         if let Ok(mut iter) = app.input_events_iter() {
             loop {
-                let has_more = iter.next(|_event| InputStatus::Unhandled);
+                let has_more = iter.next(|event| {
+                    if let InputEvent::MotionEvent(motion) = event {
+                        if let Some(pointer) = motion.pointers().next() {
+                            let (x, y) = (pointer.x(), pointer.y());
+                            if let Some(state) = gpu.as_mut() {
+                                match motion.action() {
+                                    MotionAction::Down | MotionAction::PointerDown => {
+                                        state.touch_down(x, y, pixels_per_point);
+                                    }
+                                    MotionAction::Move => {
+                                        state.touch_move(x, y, pixels_per_point);
+                                    }
+                                    MotionAction::Up | MotionAction::PointerUp | MotionAction::Cancel => {
+                                        state.touch_up(x, y, pixels_per_point);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    InputStatus::Unhandled
+                });
                 if !has_more {
                     break;
                 }
             }
         }
 
-        if let Some(state) = &gpu {
-            state.render(BACKGROUND);
+        if let Some(state) = gpu.as_mut() {
+            state.render(BACKGROUND, pixels_per_point);
         }
     }
-            }
+                                        }
