@@ -1,14 +1,8 @@
 // crates/mxross-android/src/test_cube.rs
 //! Hardcoded six-colored-face cube — a throwaway test primitive to prove
-//! the GPU path actually renders real 3D geometry with correct depth, not
-//! just a flat clear color. This is NOT the brush/canvas renderer; it
-//! gets replaced once mid-math's camera lands and there's real scene
-//! content to draw.
-//!
-//! Camera here is a fixed perspective view, not the locked-orthographic
-//! free-roam viewport decided on for the real canvas — perspective makes
-//! it visually obvious whether 3D depth/orientation is actually correct,
-//! which a straight-on orthographic view of one face wouldn't prove.
+//! the GPU path actually renders real 3D geometry with correct depth.
+//! Camera math lives in camera.rs now; this just uploads whatever
+//! view-projection matrix it's given.
 //!
 //! No backface culling: `primitive: PrimitiveState::default()` leaves
 //! `cull_mode: None`, so the cube's vertex winding doesn't need to be
@@ -16,7 +10,7 @@
 
 use wgpu::util::DeviceExt;
 
-use mxross_math::{Mat4, Vec3};
+use mxross_math::Mat4;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -196,16 +190,10 @@ impl TestCube {
         }
     }
 
-    /// Recomputes the view-projection matrix for the given aspect ratio
-    /// and uploads it. Fixed eye position/target — there's no orbit
-    /// control yet, this is purely "prove the depth/orientation math is
-    /// right", not the real camera.
-    pub fn update_camera(&self, queue: &wgpu::Queue, aspect: f32) {
-        let eye = Vec3::new(2.0, 1.8, 2.5);
-        let proj = Mat4::perspective_rh(45.0_f32.to_radians(), aspect, 0.1, 100.0);
-        let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
-        let view_proj = proj * view;
-
+    /// Uploads a precomputed view-projection matrix. Called once per
+    /// frame from GpuState::render — recomputing a 4x4 matrix multiply
+    /// every frame for one object is free; no dirty-flagging needed here.
+    pub fn set_camera(&self, queue: &wgpu::Queue, view_proj: Mat4) {
         queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -220,4 +208,4 @@ impl TestCube {
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         pass.draw_indexed(0..self.index_count, 0, 0..1);
     }
-      }
+}
