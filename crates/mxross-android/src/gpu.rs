@@ -14,6 +14,20 @@
 //! `DisplayHandle::android()` constructor. `WindowHandles` below bundles
 //! a `NativeWindow` with that marker so the combined type satisfies
 //! wgpu's `DisplayAndWindowHandle` bound directly.
+//!
+//! ## The egui depth_stencil gap (the actual cause of the launch crash)
+//!
+//! A render pipeline with `depth_stencil: None` is NOT compatible with a
+//! render pass that has a depth/stencil attachment — wgpu validates this
+//! and it crashes (see `emilk/egui#2083`, the documented version of
+//! exactly this). `egui_wgpu::RendererOptions::default()` sets
+//! `depth_stencil_format: None`, which is fine for a UI-only pass with no
+//! depth buffer, but wrong here since the cube's pass HAS one. Passing
+//! `depth_stencil_format: Some(DEPTH_FORMAT)` below makes egui's pipeline
+//! declare a depth state with `depth_write_enabled: false` and
+//! `depth_compare: Always` — it stays compatible with the pass without
+//! actually being depth-tested, which is what "draws flat on top" means
+//! in practice.
 
 use ndk::native_window::NativeWindow;
 use raw_window_handle::{
@@ -123,10 +137,17 @@ impl GpuState {
 
         let depth_view = Self::create_depth_view(&device, width, height);
         let test_cube = TestCube::new(&device, config.format, DEPTH_FORMAT);
-        // egui draws flat on top of the cube, ignoring depth entirely —
-        // depth_stencil_format: None in RendererOptions::default() is
-        // exactly that, not just a convenient default.
-        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, egui_wgpu::RendererOptions::default());
+        // depth_stencil_format MUST match the pass's depth attachment —
+        // see the module doc comment above. This is the actual fix for
+        // the launch crash, not just a tidy-up.
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            config.format,
+            egui_wgpu::RendererOptions {
+                depth_stencil_format: Some(DEPTH_FORMAT),
+                ..Default::default()
+            },
+        );
 
         Ok(Self {
             surface,
