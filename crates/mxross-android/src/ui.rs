@@ -1,15 +1,15 @@
 // crates/mxross-android/src/ui.rs
 //! egui integration — the foundation for every future UI element in
 //! MxRoss Canvas (tool palette, layers panel, brush settings, etc.), not
-//! just this one camera-mode button. There's no winit anywhere in this
+//! just this camera toggle/readout. There's no winit anywhere in this
 //! app, so there's no egui-winit glue to lean on — touch events are
 //! translated into `egui::Event`s by hand in gpu.rs and fed in here
 //! directly.
 //!
-//! Currently this builds exactly one widget (the locked-ortho/free-orbit
-//! toggle). As more UI lands, this is the natural place to split "egui
-//! plumbing" from "the actual widgets" — doing that split now, with only
-//! one widget to learn from, would be guessing at the wrong abstraction.
+//! Currently builds two widgets (mode toggle + camera readout). As more
+//! UI lands, this is the natural place to split "egui plumbing" from
+//! "the actual widgets" — doing that split now, with only two widgets to
+//! learn from, would still be guessing at the wrong abstraction.
 
 use std::time::Instant;
 
@@ -38,9 +38,7 @@ impl AppUi {
     /// widget) — checked by GpuState before applying camera-orbit drag
     /// deltas, so dragging on the toggle button doesn't also spin the
     /// camera underneath it. One-frame-stale by construction (reflects
-    /// the previous call to `run_frame`), which only matters if a touch
-    /// goes down AND drags within the same ~16ms tick — not worth
-    /// chasing for a single button.
+    /// the previous call to `run_frame`).
     pub fn pointer_over_ui(&self) -> bool {
         self.pointer_over_ui
     }
@@ -66,11 +64,16 @@ impl AppUi {
             ..Default::default()
         };
 
-        // Read the mode and write back any click *outside* the closure —
+        // Read everything we need from `camera` *before* the closure —
         // capturing `camera` itself inside the closure (a &mut borrow)
-        // while also wanting to read it for the label would fight the
-        // borrow checker for no real benefit.
+        // while also wanting to read it for the labels would fight the
+        // borrow checker for no real benefit. `readout` is a String
+        // (non-Copy), so it's read via `.as_str()` inside the closure
+        // rather than moved — `run_ui`'s closure bound is `FnMut`, and
+        // moving a captured non-Copy value out of an FnMut closure
+        // doesn't compile (it'd only be valid to move it out once).
         let mode = camera.mode();
+        let readout = camera.readout();
         let mut clicked = false;
 
         let output = self.ctx.run_ui(raw_input, |ui| {
@@ -84,6 +87,12 @@ impl AppUi {
                     if ui.button(label).clicked() {
                         clicked = true;
                     }
+                });
+
+            egui::Area::new(egui::Id::new("camera_readout"))
+                .fixed_pos(egui::pos2(16.0, 56.0))
+                .show(ui.ctx(), |ui| {
+                    ui.label(readout.as_str());
                 });
         });
 
@@ -101,4 +110,4 @@ impl Default for AppUi {
     fn default() -> Self {
         Self::new()
     }
-  }
+                                      }
