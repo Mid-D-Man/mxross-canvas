@@ -15,19 +15,15 @@
 //! a `NativeWindow` with that marker so the combined type satisfies
 //! wgpu's `DisplayAndWindowHandle` bound directly.
 //!
-//! ## The egui depth_stencil gap (the actual cause of the launch crash)
+//! ## The egui depth_stencil gap
 //!
 //! A render pipeline with `depth_stencil: None` is NOT compatible with a
-//! render pass that has a depth/stencil attachment — wgpu validates this
-//! and it crashes (see `emilk/egui#2083`, the documented version of
-//! exactly this). `egui_wgpu::RendererOptions::default()` sets
-//! `depth_stencil_format: None`, which is fine for a UI-only pass with no
-//! depth buffer, but wrong here since the cube's pass HAS one. Passing
-//! `depth_stencil_format: Some(DEPTH_FORMAT)` below makes egui's pipeline
-//! declare a depth state with `depth_write_enabled: false` and
-//! `depth_compare: Always` — it stays compatible with the pass without
-//! actually being depth-tested, which is what "draws flat on top" means
-//! in practice.
+//! render pass that has a depth/stencil attachment (see `emilk/egui#2083`).
+//! `RendererOptions::default()` sets `depth_stencil_format: None`, which
+//! is wrong here since the cube's pass has one — `Some(DEPTH_FORMAT)`
+//! below makes egui's pipeline declare a depth state with
+//! `depth_write_enabled: false` / `depth_compare: Always`, staying
+//! compatible with the pass without actually being depth-tested.
 
 use ndk::native_window::NativeWindow;
 use raw_window_handle::{
@@ -62,8 +58,8 @@ impl HasDisplayHandle for WindowHandles {
 /// Everything needed to render a frame. Rebuilt from scratch on every
 /// Android `InitWindow` event and torn down on `TerminateWindow` (see
 /// lib.rs) — which means camera mode and egui's internal state also
-/// reset on a window swap (e.g. a real backgrounding/foregrounding
-/// event). Acceptable for now; revisit only if that turns out to bite.
+/// reset on a window swap. Acceptable for now; revisit only if that
+/// turns out to bite.
 pub struct GpuState {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -76,9 +72,12 @@ pub struct GpuState {
     egui_renderer: egui_wgpu::Renderer,
     pending_ui_events: Vec<egui::Event>,
     /// Last single-finger touch position, in window pixel coordinates.
-    /// None whenever no finger is down — cleared on touch_up so a fresh
-    /// touch-down doesn't compute a delta against stale data.
+    /// None whenever no finger is down.
     last_touch: Option<(f32, f32)>,
+    /// Distance between the first two active pointers, in pixels, as of
+    /// the last `touch_move` call. None whenever fewer than two fingers
+    /// are down.
+    last_pinch_distance: Option<f32>,
 }
 
 impl GpuState {
@@ -137,9 +136,6 @@ impl GpuState {
 
         let depth_view = Self::create_depth_view(&device, width, height);
         let test_cube = TestCube::new(&device, config.format, DEPTH_FORMAT);
-        // depth_stencil_format MUST match the pass's depth attachment —
-        // see the module doc comment above. This is the actual fix for
-        // the launch crash, not just a tidy-up.
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,
             config.format,
@@ -161,6 +157,7 @@ impl GpuState {
             egui_renderer,
             pending_ui_events: Vec::new(),
             last_touch: None,
+            last_pinch_distance: None,
         })
     }
 
@@ -200,21 +197,39 @@ impl GpuState {
             modifiers: egui::Modifiers::NONE,
         });
         self.last_touch = Some((x, y));
+        self.last_pinch_distance = None;
     }
 
-    pub fn touch_move(&mut self, x: f32, y: f32, pixels_per_point: f32) {
+    /// `pointers` are ALL currently active touches, in window pixel
+    /// coordinates. egui only ever sees the first one (it has no concept
+    /// of multi-touch); a second pointer drives pinch-to-zoom instead of
+    /// camera orbit.
+    pub fn touch_move(&mut self, pointers: &[(f32, f32)], pixels_per_point: f32) {
+        let Some(&(x, y)) = pointers.first() else { return };
+
         self.pending_ui_events.push(egui::Event::PointerMoved(egui::pos2(
             x / pixels_per_point,
             y / pixels_per_point,
         )));
 
-        if let Some((lx, ly)) = self.last_touch {
-            // Only orbit if egui didn't claim the pointer last frame —
-            // see AppUi::pointer_over_ui's doc comment.
-            if !self.ui.pointer_over_ui() {
-                self.camera.handle_drag(x - lx, y - ly);
+        if pointers.len() >= 2 {
+            let (x1, y1) = pointers[1];
+            let distance = ((x1 - x).powi(2) + (y1 - y).powi(2)).sqrt();
+            if let Some(last) = self.last_pinch_distance {
+                self.camera.zoom(distance / last.max(1.0));
+            }
+            self.last_pinch_distance = Some(distance);
+        } else {
+            self.last_pinch_distance = None;
+            if let Some((lx, ly)) = self.last_touch {
+                // Only orbit if egui didn't claim the pointer last frame
+                // — see AppUi::pointer_over_ui's doc comment.
+                if !self.ui.pointer_over_ui() {
+                    self.camera.handle_drag(x - lx, y - ly);
+                }
             }
         }
+
         self.last_touch = Some((x, y));
     }
 
@@ -227,14 +242,11 @@ impl GpuState {
         });
         self.pending_ui_events.push(egui::Event::PointerGone);
         self.last_touch = None;
+        self.last_pinch_distance = None;
     }
 
     /// Clears to `clear_color`, depth-tests the cube, then draws the
     /// egui UI flat on top.
-    ///
-    /// `Outdated`/`Lost` are deliberately just skipped for now rather
-    /// than recovered from — fine while iterating, since InitWindow
-    /// already rebuilds GpuState from scratch on any real window swap.
     pub fn render(&mut self, clear_color: wgpu::Color, pixels_per_point: f32) {
         let aspect = self.config.width as f32 / self.config.height as f32;
         self.test_cube.set_camera(&self.queue, self.camera.view_proj(aspect));
@@ -272,8 +284,6 @@ impl GpuState {
                 label: Some("mxross-android frame encoder"),
             });
 
-        // Apply texture changes before painting, per egui's documented
-        // contract (the font atlas texture shows up here on frame one).
         for (id, image_delta) in &output.textures_delta.set {
             self.egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta);
         }
@@ -313,10 +323,6 @@ impl GpuState {
 
             self.test_cube.draw(&mut pass);
 
-            // egui-wgpu's render() requires a 'static render pass —
-            // forget_lifetime() only relaxes a compile-time
-            // "don't touch the encoder" check to a runtime one; see its
-            // doc comment. Nothing unsafe, just a borrow-checker downgrade.
             let mut pass = pass.forget_lifetime();
             self.egui_renderer.render(&mut pass, &paint_jobs, &screen_descriptor);
         }
@@ -324,9 +330,8 @@ impl GpuState {
         self.queue.submit(extra_cmds.into_iter().chain(std::iter::once(encoder.finish())));
         frame.present();
 
-        // Free after painting, per egui's contract.
         for id in &output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
     }
-            }
+    }
