@@ -28,9 +28,33 @@ const BACKGROUND: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
+/// Writes any future panic to a plain text file instead of (only) the
+/// Android log, since logcat isn't always reachable from a phone-only
+/// workflow. Prefers external storage — on most devices that's
+/// `/storage/emulated/0/Android/data/com.midmanstudio.mxross/files/crash.txt`,
+/// browsable with a normal file manager (e.g. Samsung's My Files: Internal
+/// storage -> Android -> data -> com.midmanstudio.mxross -> files).
+/// Falls back to internal storage if external isn't available; that path
+/// is sandboxed and not normally browsable without adb, but it's better
+/// than nothing if external_data_path() ever returns None.
+fn install_panic_hook(app: &AndroidApp) {
+    let crash_path = app
+        .external_data_path()
+        .or_else(|| app.internal_data_path())
+        .map(|dir| dir.join("crash.txt"));
+
+    if let Some(path) = crash_path {
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = std::fs::write(&path, format!("{info}\n"));
+            log::error!("PANIC: {info}");
+        }));
+    }
+}
+
 #[no_mangle]
 fn android_main(app: AndroidApp) {
     mxross_ffi::init_logger();
+    install_panic_hook(&app);
 
     let mut gpu: Option<GpuState> = None;
 
@@ -102,4 +126,4 @@ fn android_main(app: AndroidApp) {
             state.render(BACKGROUND, pixels_per_point);
         }
     }
-                                        }
+    }
