@@ -1,8 +1,9 @@
 // crates/mxross-android/src/camera.rs
 //! Touch-driven camera for the test cube — two modes, matching the
 //! decided MxRoss Canvas viewport architecture:
-//!   - `LockedOrtho` (default): flat orthographic view, no drag input.
-//!   - `FreeOrbit`: perspective orbit, single-finger drag.
+//!   - `LockedOrtho` (default): flat orthographic view, no drag input,
+//!     pinch-to-zoom only.
+//!   - `FreeOrbit`: perspective orbit, single-finger drag + pinch-zoom.
 //! Toggled via the egui button in ui.rs. Still part of the throwaway
 //! test scene, not the real canvas viewport — that comes later, once
 //! there's real content to look at and mid-math is wired in for the
@@ -20,6 +21,18 @@ const ORBIT_SENSITIVITY: f32 = 0.005;
 /// anything (gimbal lock) and the look-at "up" vector starts to wobble as
 /// you approach it.
 const MAX_PITCH: f32 = 85.0 / 180.0 * std::f32::consts::PI;
+
+/// Pinch-zoom clamp on `radius` — arbitrary, easy to retune. Also bounds
+/// how close/far the LockedOrtho half-height can get, since both modes
+/// share this one knob.
+const MIN_RADIUS: f32 = 1.0;
+const MAX_RADIUS: f32 = 20.0;
+
+/// `LockedOrtho`'s half-height as a fraction of `radius` — chosen so the
+/// default radius (4.0) reproduces the original hardcoded half-height
+/// (2.5) exactly, while still tracking pinch-zoom the same way
+/// FreeOrbit's distance does.
+const ORTHO_HALF_HEIGHT_FACTOR: f32 = 0.625;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CameraMode {
@@ -65,6 +78,33 @@ impl OrbitCamera {
         self.pitch = (self.pitch - dy * ORBIT_SENSITIVITY).clamp(-MAX_PITCH, MAX_PITCH);
     }
 
+    /// `factor` is `current_pinch_distance / previous_pinch_distance` —
+    /// >1.0 means fingers spread apart (zoom in / move closer), <1.0
+    /// means fingers pinched together (zoom out). Works in both camera
+    /// modes since both `view_proj` branches read `radius`.
+    pub fn zoom(&mut self, factor: f32) {
+        if factor <= 0.0 || !factor.is_finite() {
+            return;
+        }
+        self.radius = (self.radius / factor).clamp(MIN_RADIUS, MAX_RADIUS);
+    }
+
+    /// Short human-readable camera state, for the on-screen readout.
+    /// Shown as yaw/pitch/distance (the camera's actual internal state)
+    /// rather than raw XYZ — more meaningful for an orbit camera, but
+    /// say so if you'd rather see Cartesian eye coordinates instead.
+    pub fn readout(&self) -> String {
+        match self.mode {
+            CameraMode::LockedOrtho => format!("Locked Ortho — zoom {:.2}", self.radius),
+            CameraMode::FreeOrbit => format!(
+                "Free Orbit — yaw {:.0}°  pitch {:.0}°  dist {:.2}",
+                self.yaw.to_degrees(),
+                self.pitch.to_degrees(),
+                self.radius,
+            ),
+        }
+    }
+
     fn eye(&self) -> Vec3 {
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
         let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
@@ -78,7 +118,7 @@ impl OrbitCamera {
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         match self.mode {
             CameraMode::LockedOrtho => {
-                let half_height = 2.5;
+                let half_height = self.radius * ORTHO_HALF_HEIGHT_FACTOR;
                 let half_width = half_height * aspect;
                 let proj = Mat4::orthographic_rh(
                     -half_width, half_width, -half_height, half_height, 0.1, 100.0,
@@ -99,4 +139,4 @@ impl Default for OrbitCamera {
     fn default() -> Self {
         Self::new()
     }
-  }
+}
