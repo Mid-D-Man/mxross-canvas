@@ -1,11 +1,5 @@
 // crates/mxross-android/src/lib.rs
 //! MxRoss Canvas — Android entry point.
-//!
-//! Real GPU path: Instance -> Surface -> Adapter -> Device, one
-//! depth-tested render pass per frame drawing a hardcoded test cube from
-//! a touch-driven camera, plus an egui UI overlay (the locked-ortho/
-//! free-orbit toggle). See gpu.rs (wgpu setup), test_cube.rs (test
-//! geometry), camera.rs (camera math), ui.rs (egui integration).
 
 mod camera;
 mod gpu;
@@ -32,11 +26,7 @@ const BACKGROUND: wgpu::Color = wgpu::Color {
 /// Android log, since logcat isn't always reachable from a phone-only
 /// workflow. Prefers external storage — on most devices that's
 /// `/storage/emulated/0/Android/data/com.midmanstudio.mxross/files/crash.txt`,
-/// browsable with a normal file manager (e.g. Samsung's My Files: Internal
-/// storage -> Android -> data -> com.midmanstudio.mxross -> files).
-/// Falls back to internal storage if external isn't available; that path
-/// is sandboxed and not normally browsable without adb, but it's better
-/// than nothing if external_data_path() ever returns None.
+/// browsable with a normal file manager.
 fn install_panic_hook(app: &AndroidApp) {
     let crash_path = app
         .external_data_path()
@@ -85,32 +75,33 @@ fn android_main(app: AndroidApp) {
             }
         });
 
-        // Density bucket / 160 — Android's standard DPI-scale convention
-        // (160 = mdpi = 1.0x). Cheap enough to just recompute every tick
-        // rather than caching and tracking ConfigChanged separately.
         let pixels_per_point = app.config().density().unwrap_or(160) as f32 / 160.0;
 
-        // Single-finger touch -> both the orbit camera and egui. Only
-        // ever looks at the first pointer — no multi-touch handling yet.
+        // Single-finger -> orbit (or egui). Two fingers, on Move ->
+        // pinch-zoom. android-activity reports ALL active pointers on
+        // every Move event, not just the one that changed.
         if let Ok(mut iter) = app.input_events_iter() {
             loop {
                 let has_more = iter.next(|event| {
                     if let InputEvent::MotionEvent(motion) = event {
-                        if let Some(pointer) = motion.pointers().next() {
-                            let (x, y) = (pointer.x(), pointer.y());
-                            if let Some(state) = gpu.as_mut() {
-                                match motion.action() {
-                                    MotionAction::Down | MotionAction::PointerDown => {
-                                        state.touch_down(x, y, pixels_per_point);
+                        if let Some(state) = gpu.as_mut() {
+                            match motion.action() {
+                                MotionAction::Down | MotionAction::PointerDown => {
+                                    if let Some(p) = motion.pointers().next() {
+                                        state.touch_down(p.x(), p.y(), pixels_per_point);
                                     }
-                                    MotionAction::Move => {
-                                        state.touch_move(x, y, pixels_per_point);
-                                    }
-                                    MotionAction::Up | MotionAction::PointerUp | MotionAction::Cancel => {
-                                        state.touch_up(x, y, pixels_per_point);
-                                    }
-                                    _ => {}
                                 }
+                                MotionAction::Move => {
+                                    let pointers: Vec<(f32, f32)> =
+                                        motion.pointers().map(|p| (p.x(), p.y())).collect();
+                                    state.touch_move(&pointers, pixels_per_point);
+                                }
+                                MotionAction::Up | MotionAction::PointerUp | MotionAction::Cancel => {
+                                    if let Some(p) = motion.pointers().next() {
+                                        state.touch_up(p.x(), p.y(), pixels_per_point);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -126,4 +117,4 @@ fn android_main(app: AndroidApp) {
             state.render(BACKGROUND, pixels_per_point);
         }
     }
-    }
+                        }
