@@ -2,12 +2,16 @@
 //! Touch-driven camera for the test cube — two modes, matching the
 //! decided MxRoss Canvas viewport architecture:
 //!   - `LockedOrtho` (default): flat orthographic view, no drag input,
-//!     pinch-to-zoom only.
-//!   - `FreeOrbit`: perspective orbit, single-finger drag + pinch-zoom.
-//! Toggled via the egui button in ui.rs. Still part of the throwaway
-//! test scene, not the real canvas viewport — that comes later, once
-//! there's real content to look at and mid-math is wired in for the
-//! projection/picking math.
+//!     pinch-to-zoom and axis-gizmo snapping only.
+//!   - `FreeOrbit`: perspective orbit, single-finger drag + pinch-zoom +
+//!     axis-gizmo snapping.
+//! Both modes share one yaw/pitch/radius state — "locked" only means
+//! "no free dragging", not "frozen direction"; clicking a gizmo ball (see
+//! gizmo.rs) re-points either mode at a cardinal axis, exactly like
+//! Blender's numpad views. Toggled via the egui button in ui.rs. Still
+//! part of the throwaway test scene, not the real canvas viewport — that
+//! comes later, once there's real content to look at and mid-math is
+//! wired in for the projection/picking math.
 
 use mxross_math::{Mat4, Vec3};
 
@@ -17,22 +21,59 @@ use mxross_math::{Mat4, Vec3};
 /// derive from first principles.
 const ORBIT_SENSITIVITY: f32 = 0.005;
 
-/// Keeps pitch away from the poles — at exactly ±90° `yaw` stops doing
-/// anything (gimbal lock) and the look-at "up" vector starts to wobble as
-/// you approach it.
-const MAX_PITCH: f32 = 85.0 / 180.0 * std::f32::consts::PI;
+/// Keeps free-drag pitch away from the poles — at exactly ±90° `yaw`
+/// stops doing anything mid-drag, which feels broken in a way a discrete
+/// gizmo snap to the same angle does not (see `up_vector`'s pole
+/// handling, which is what makes landing exactly on ±90° safe for a
+/// *snap* specifically).
+const MAX_DRAG_PITCH: f32 = 85.0 / 180.0 * std::f32::consts::PI;
 
-/// Pinch-zoom clamp on `radius` — arbitrary, easy to retune. Also bounds
-/// how close/far the LockedOrtho half-height can get, since both modes
-/// share this one knob.
+/// Pinch-zoom clamp on `radius`. Also bounds the LockedOrtho half-height,
+/// since both modes share this one knob.
 const MIN_RADIUS: f32 = 1.0;
 const MAX_RADIUS: f32 = 20.0;
 
 /// `LockedOrtho`'s half-height as a fraction of `radius` — chosen so the
 /// default radius (4.0) reproduces the original hardcoded half-height
-/// (2.5) exactly, while still tracking pinch-zoom the same way
-/// FreeOrbit's distance does.
+/// (2.5).
 const ORTHO_HALF_HEIGHT_FACTOR: f32 = 0.625;
+
+/// A cardinal world axis, as offered by the gizmo (gizmo.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Axis {
+    PosX,
+    NegX,
+    PosY,
+    NegY,
+    PosZ,
+    NegZ,
+}
+
+impl Axis {
+    pub fn direction(self) -> Vec3 {
+        match self {
+            Axis::PosX => Vec3::X,
+            Axis::NegX => Vec3::NEG_X,
+            Axis::PosY => Vec3::Y,
+            Axis::NegY => Vec3::NEG_Y,
+            Axis::PosZ => Vec3::Z,
+            Axis::NegZ => Vec3::NEG_Z,
+        }
+    }
+
+    /// (yaw, pitch) in degrees that puts the eye out along this axis,
+    /// looking back toward the origin.
+    fn yaw_pitch_degrees(self) -> (f32, f32) {
+        match self {
+            Axis::PosZ => (0.0, 0.0),
+            Axis::NegZ => (180.0, 0.0),
+            Axis::PosX => (90.0, 0.0),
+            Axis::NegX => (-90.0, 0.0),
+            Axis::PosY => (0.0, 90.0),
+            Axis::NegY => (0.0, -90.0),
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CameraMode {
@@ -50,8 +91,11 @@ pub struct OrbitCamera {
 impl OrbitCamera {
     pub fn new() -> Self {
         Self {
-            yaw: 45.0_f32.to_radians(),
-            pitch: 30.0_f32.to_radians(),
+            // Front view by default — matches the original hardcoded
+            // LockedOrtho eye exactly, just expressed as yaw/pitch now
+            // that both modes share this state.
+            yaw: 0.0,
+            pitch: 0.0,
             radius: 4.0,
             mode: CameraMode::LockedOrtho,
         }
@@ -75,13 +119,12 @@ impl OrbitCamera {
             return;
         }
         self.yaw += dx * ORBIT_SENSITIVITY;
-        self.pitch = (self.pitch - dy * ORBIT_SENSITIVITY).clamp(-MAX_PITCH, MAX_PITCH);
+        self.pitch = (self.pitch - dy * ORBIT_SENSITIVITY).clamp(-MAX_DRAG_PITCH, MAX_DRAG_PITCH);
     }
 
     /// `factor` is `current_pinch_distance / previous_pinch_distance` —
-    /// >1.0 means fingers spread apart (zoom in / move closer), <1.0
-    /// means fingers pinched together (zoom out). Works in both camera
-    /// modes since both `view_proj` branches read `radius`.
+    /// >1.0 zooms in, <1.0 zooms out. Works in both camera modes since
+    /// both `view_proj` branches read `radius`.
     pub fn zoom(&mut self, factor: f32) {
         if factor <= 0.0 || !factor.is_finite() {
             return;
@@ -89,10 +132,17 @@ impl OrbitCamera {
         self.radius = (self.radius / factor).clamp(MIN_RADIUS, MAX_RADIUS);
     }
 
+    /// Snaps to look directly down a cardinal axis — works in either
+    /// mode, and deliberately bypasses `MAX_DRAG_PITCH`: a snap lands
+    /// exactly on ±90° for true top/bottom views, which is safe here
+    /// because `up_vector` special-cases exactly that angle.
+    pub fn snap_to_axis(&mut self, axis: Axis) {
+        let (yaw, pitch) = axis.yaw_pitch_degrees();
+        self.yaw = yaw.to_radians();
+        self.pitch = pitch.to_radians();
+    }
+
     /// Short human-readable camera state, for the on-screen readout.
-    /// Shown as yaw/pitch/distance (the camera's actual internal state)
-    /// rather than raw XYZ — more meaningful for an orbit camera, but
-    /// say so if you'd rather see Cartesian eye coordinates instead.
     pub fn readout(&self) -> String {
         match self.mode {
             CameraMode::LockedOrtho => format!("Locked Ortho — zoom {:.2}", self.radius),
@@ -105,17 +155,50 @@ impl OrbitCamera {
         }
     }
 
-    fn eye(&self) -> Vec3 {
+    /// Unit direction from the look-at target toward the eye.
+    fn direction(&self) -> Vec3 {
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
         let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
-        Vec3::new(
-            self.radius * cos_pitch * sin_yaw,
-            self.radius * sin_pitch,
-            self.radius * cos_pitch * cos_yaw,
-        )
+        Vec3::new(cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw)
+    }
+
+    fn eye(&self) -> Vec3 {
+        self.direction() * self.radius
+    }
+
+    /// World "up" reference fed to `look_at_rh`. `Vec3::Y` everywhere
+    /// except within ~1° of looking straight up/down — there, the view
+    /// direction and `Y` become parallel, which makes `look_at_rh`'s
+    /// internal cross product degenerate (NaN). Free-drag never reaches
+    /// this (clamped to ±85°); only `snap_to_axis`'s exact ±90° top/
+    /// bottom views do, so this only ever matters right after a gizmo
+    /// click on the Y ball.
+    fn up_vector(&self) -> Vec3 {
+        if self.pitch > 89.0_f32.to_radians() {
+            Vec3::NEG_Z
+        } else if self.pitch < -89.0_f32.to_radians() {
+            Vec3::Z
+        } else {
+            Vec3::Y
+        }
+    }
+
+    /// `(right, up, forward)` camera-space basis for the current view —
+    /// `forward` points from the eye toward the look-at target (i.e.
+    /// "into the screen"). Used by the gizmo to project world axes into
+    /// screen space without needing the full projection matrix. Same
+    /// cross-product order `Mat4::look_at_rh` uses internally, so this
+    /// basis matches what's actually on screen.
+    pub fn basis(&self) -> (Vec3, Vec3, Vec3) {
+        let forward = -self.direction();
+        let up_hint = self.up_vector();
+        let right = forward.cross(up_hint).normalize();
+        let up = right.cross(forward);
+        (right, up, forward)
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
+        let view = Mat4::look_at_rh(self.eye(), Vec3::ZERO, self.up_vector());
         match self.mode {
             CameraMode::LockedOrtho => {
                 let half_height = self.radius * ORTHO_HALF_HEIGHT_FACTOR;
@@ -123,12 +206,10 @@ impl OrbitCamera {
                 let proj = Mat4::orthographic_rh(
                     -half_width, half_width, -half_height, half_height, 0.1, 100.0,
                 );
-                let view = Mat4::look_at_rh(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO, Vec3::Y);
                 proj * view
             }
             CameraMode::FreeOrbit => {
                 let proj = Mat4::perspective_rh(45.0_f32.to_radians(), aspect, 0.1, 100.0);
-                let view = Mat4::look_at_rh(self.eye(), Vec3::ZERO, Vec3::Y);
                 proj * view
             }
         }
@@ -139,4 +220,4 @@ impl Default for OrbitCamera {
     fn default() -> Self {
         Self::new()
     }
-}
+                }
