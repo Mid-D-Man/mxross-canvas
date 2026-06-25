@@ -84,9 +84,14 @@ pub struct GpuState {
     /// and on `second_touch_down` — that second case matters: without
     /// it, a second finger landing mid-stroke (to start a pinch) would
     /// otherwise leave one stray dab at wherever the first finger
-    /// happened to be, since `touch_move`'s two-pointer branch wouldn't
-    /// have stopped it any other way.
+    /// happened to be.
     is_painting: bool,
+    /// Canvas UV of the last dab actually stamped this stroke — NOT the
+    /// same as `last_touch` (which is in screen pixels and updates every
+    /// sample regardless of painting). Feeds `PaintCanvas::stamp_segment`
+    /// so fast strokes get filled in instead of leaving gaps. Reset to
+    /// `None` at the start of every new stroke.
+    last_stamp_uv: Option<(f32, f32)>,
 }
 
 impl GpuState {
@@ -169,6 +174,7 @@ impl GpuState {
             last_touch: None,
             last_pinch_distance: None,
             is_painting: false,
+            last_stamp_uv: None,
         })
     }
 
@@ -202,7 +208,10 @@ impl GpuState {
         self.camera.mode() == CameraMode::LockedOrtho && self.camera.is_front_view()
     }
 
-    fn try_stamp(&self, x: f32, y: f32) {
+    /// Maps `(x, y)` to canvas UV and stamps a spacing-interpolated
+    /// segment from `last_stamp_uv` to there, updating `last_stamp_uv` to
+    /// wherever interpolation left off.
+    fn try_stamp(&mut self, x: f32, y: f32) {
         let aspect = self.config.width as f32 / self.config.height as f32;
         let ortho_extents = self.camera.ortho_half_extents(aspect);
         if let Some(uv) = canvas::screen_to_canvas_uv(
@@ -213,7 +222,14 @@ impl GpuState {
             ortho_extents,
             self.canvas.half_size(),
         ) {
-            self.canvas.stamp(&self.device, &self.queue, uv, &self.brush);
+            let cursor = self.canvas.stamp_segment(
+                &self.device,
+                &self.queue,
+                self.last_stamp_uv,
+                uv,
+                &self.brush,
+            );
+            self.last_stamp_uv = Some(cursor);
         }
     }
 
@@ -229,13 +245,17 @@ impl GpuState {
             modifiers: egui::Modifiers::NONE,
         });
         self.last_touch = Some((x, y));
+        // Every new stroke starts fresh — without this, the first dab of
+        // a new stroke would interpolate a stray line connecting it back
+        // to wherever the *previous* stroke ended.
+        self.last_stamp_uv = None;
 
         // One-frame-stale pointer_over_ui — same accepted caveat as
         // camera-drag arbitration: tapping directly on a UI element
         // could in principle leave one stray dab before egui catches up
-        // the following frame. In practice the canvas doesn't reach the
-        // screen corners where the UI lives at default zoom, so this is
-        // a narrow edge case, not a constant annoyance.
+        // the following frame. The canvas doesn't reach the screen
+        // corners where the UI lives at default zoom, so this is a
+        // narrow edge case, not a constant annoyance.
         self.is_painting = self.can_paint() && !self.ui.pointer_over_ui();
         if self.is_painting {
             self.try_stamp(x, y);
@@ -247,6 +267,7 @@ impl GpuState {
     /// leave a stray dab where the first finger happened to be.
     pub fn second_touch_down(&mut self) {
         self.is_painting = false;
+        self.last_stamp_uv = None;
     }
 
     /// `pointers` are ALL currently active touches, in window pixel
@@ -274,11 +295,6 @@ impl GpuState {
             if self.is_painting {
                 self.try_stamp(x, y);
             } else if let Some((lx, ly)) = self.last_touch {
-                // Only orbit if egui didn't claim the pointer last frame
-                // — see AppUi::pointer_over_ui's doc comment. Harmless
-                // either way in LockedOrtho (handle_drag no-ops there),
-                // but skipping it while painting avoids calling it for
-                // no reason every single stroke sample.
                 if !self.ui.pointer_over_ui() {
                     self.camera.handle_drag(x - lx, y - ly);
                 }
@@ -299,14 +315,11 @@ impl GpuState {
         self.last_touch = None;
         self.last_pinch_distance = None;
         self.is_painting = false;
+        self.last_stamp_uv = None;
     }
 
     /// Clears to `clear_color`, depth-tests the canvas plane, then draws
     /// the egui UI flat on top.
-    ///
-    /// `Outdated`/`Lost` are deliberately just skipped for now rather
-    /// than recovered from — fine while iterating, since InitWindow
-    /// already rebuilds GpuState from scratch on any real window swap.
     pub fn render(&mut self, clear_color: wgpu::Color, pixels_per_point: f32) {
         let aspect = self.config.width as f32 / self.config.height as f32;
         self.canvas.set_camera(&self.queue, self.camera.view_proj(aspect));
@@ -394,4 +407,4 @@ impl GpuState {
             self.egui_renderer.free_texture(id);
         }
     }
-}
+                }
