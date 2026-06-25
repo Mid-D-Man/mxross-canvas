@@ -2,6 +2,7 @@
 //! MxRoss Canvas — Android entry point.
 
 mod camera;
+mod gizmo;
 mod gpu;
 mod test_cube;
 mod ui;
@@ -117,4 +118,4 @@ fn android_main(app: AndroidApp) {
             state.render(BACKGROUND, pixels_per_point);
         }
     }
-                        }
+    }
