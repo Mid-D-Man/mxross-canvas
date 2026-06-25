@@ -1,10 +1,11 @@
 // crates/mxross-android/src/lib.rs
 //! MxRoss Canvas — Android entry point.
 
+mod brush;
 mod camera;
+mod canvas;
 mod gizmo;
 mod gpu;
-mod test_cube;
 mod ui;
 
 use std::time::Duration;
@@ -14,8 +15,8 @@ use android_activity::{AndroidApp, InputStatus, MainEvent, PollEvent};
 
 use gpu::GpuState;
 
-/// Dark canvas background — same color the original software-pixel test
-/// used.
+/// Dark canvas background — visible in the margin around the paint
+/// canvas plane (the canvas itself is the white quad).
 const BACKGROUND: wgpu::Color = wgpu::Color {
     r: 30.0 / 255.0,
     g: 30.0 / 255.0,
@@ -78,19 +79,22 @@ fn android_main(app: AndroidApp) {
 
         let pixels_per_point = app.config().density().unwrap_or(160) as f32 / 160.0;
 
-        // Single-finger -> orbit (or egui). Two fingers, on Move ->
-        // pinch-zoom. android-activity reports ALL active pointers on
-        // every Move event, not just the one that changed.
+        // Down (first finger) and PointerDown (an additional finger) are
+        // handled separately on purpose — see GpuState::second_touch_down's
+        // doc comment for why collapsing them caused a stray-dab bug.
         if let Ok(mut iter) = app.input_events_iter() {
             loop {
                 let has_more = iter.next(|event| {
                     if let InputEvent::MotionEvent(motion) = event {
                         if let Some(state) = gpu.as_mut() {
                             match motion.action() {
-                                MotionAction::Down | MotionAction::PointerDown => {
+                                MotionAction::Down => {
                                     if let Some(p) = motion.pointers().next() {
                                         state.touch_down(p.x(), p.y(), pixels_per_point);
                                     }
+                                }
+                                MotionAction::PointerDown => {
+                                    state.second_touch_down();
                                 }
                                 MotionAction::Move => {
                                     let pointers: Vec<(f32, f32)> =
@@ -118,4 +122,4 @@ fn android_main(app: AndroidApp) {
             state.render(BACKGROUND, pixels_per_point);
         }
     }
-    }
+                       }
