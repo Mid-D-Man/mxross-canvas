@@ -1,19 +1,20 @@
 // crates/mxross-android/src/ui.rs
 //! egui integration — the foundation for every future UI element in
 //! MxRoss Canvas (tool palette, layers panel, brush settings, etc.), not
-//! just this camera toggle/readout. There's no winit anywhere in this
-//! app, so there's no egui-winit glue to lean on — touch events are
-//! translated into `egui::Event`s by hand in gpu.rs and fed in here
-//! directly.
+//! just these camera widgets. There's no winit anywhere in this app, so
+//! there's no egui-winit glue to lean on — touch events are translated
+//! into `egui::Event`s by hand in gpu.rs and fed in here directly.
 //!
-//! Currently builds two widgets (mode toggle + camera readout). As more
-//! UI lands, this is the natural place to split "egui plumbing" from
-//! "the actual widgets" — doing that split now, with only two widgets to
-//! learn from, would still be guessing at the wrong abstraction.
+//! Builds three widgets right now: the mode toggle, the camera readout,
+//! and the axis gizmo (gizmo.rs). As more UI lands, this is the natural
+//! place to split "egui plumbing" from "the actual widgets" — doing that
+//! split now would still be guessing at the wrong abstraction with only
+//! three widgets to learn from.
 
 use std::time::Instant;
 
 use crate::camera::{CameraMode, OrbitCamera};
+use crate::gizmo;
 
 pub struct AppUi {
     ctx: egui::Context,
@@ -36,9 +37,9 @@ impl AppUi {
 
     /// True if egui claimed the pointer this frame (hovering/dragging a
     /// widget) — checked by GpuState before applying camera-orbit drag
-    /// deltas, so dragging on the toggle button doesn't also spin the
-    /// camera underneath it. One-frame-stale by construction (reflects
-    /// the previous call to `run_frame`).
+    /// deltas, so dragging on a widget doesn't also spin the camera
+    /// underneath it. One-frame-stale by construction (reflects the
+    /// previous call to `run_frame`).
     pub fn pointer_over_ui(&self) -> bool {
         self.pointer_over_ui
     }
@@ -66,15 +67,15 @@ impl AppUi {
 
         // Read everything we need from `camera` *before* the closure —
         // capturing `camera` itself inside the closure (a &mut borrow)
-        // while also wanting to read it for the labels would fight the
-        // borrow checker for no real benefit. `readout` is a String
-        // (non-Copy), so it's read via `.as_str()` inside the closure
-        // rather than moved — `run_ui`'s closure bound is `FnMut`, and
-        // moving a captured non-Copy value out of an FnMut closure
-        // doesn't compile (it'd only be valid to move it out once).
+        // while also wanting to read it for the labels/gizmo would fight
+        // the borrow checker for no real benefit. Any resulting changes
+        // (toggle click, gizmo click) are collected into locals and
+        // applied to `camera` *after* the closure returns instead.
         let mode = camera.mode();
         let readout = camera.readout();
-        let mut clicked = false;
+        let basis = camera.basis();
+        let mut clicked_toggle = false;
+        let mut clicked_axis = None;
 
         let output = self.ctx.run_ui(raw_input, |ui| {
             egui::Area::new(egui::Id::new("camera_mode_toggle"))
@@ -85,7 +86,7 @@ impl AppUi {
                         CameraMode::FreeOrbit => "Free Orbit",
                     };
                     if ui.button(label).clicked() {
-                        clicked = true;
+                        clicked_toggle = true;
                     }
                 });
 
@@ -94,10 +95,19 @@ impl AppUi {
                 .show(ui.ctx(), |ui| {
                     ui.label(readout.as_str());
                 });
+
+            egui::Area::new(egui::Id::new("camera_gizmo"))
+                .fixed_pos(egui::pos2(screen_size_points.x - 136.0, 16.0))
+                .show(ui.ctx(), |ui| {
+                    clicked_axis = gizmo::show(ui, basis);
+                });
         });
 
-        if clicked {
+        if clicked_toggle {
             camera.toggle_mode();
+        }
+        if let Some(axis) = clicked_axis {
+            camera.snap_to_axis(axis);
         }
 
         self.pointer_over_ui = self.ctx.egui_wants_pointer_input();
@@ -110,4 +120,4 @@ impl Default for AppUi {
     fn default() -> Self {
         Self::new()
     }
-                                      }
+    }
