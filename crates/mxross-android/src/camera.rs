@@ -1,17 +1,16 @@
 // crates/mxross-android/src/camera.rs
-//! Touch-driven camera for the test cube — two modes, matching the
+//! Touch-driven camera for the paint canvas — two modes, matching the
 //! decided MxRoss Canvas viewport architecture:
 //!   - `LockedOrtho` (default): flat orthographic view, no drag input,
-//!     pinch-to-zoom and axis-gizmo snapping only.
+//!     pinch-to-zoom and axis-gizmo snapping. Painting (canvas.rs) only
+//!     works here, and only in the front-facing orientation specifically
+//!     — see `is_front_view`.
 //!   - `FreeOrbit`: perspective orbit, single-finger drag + pinch-zoom +
-//!     axis-gizmo snapping.
+//!     axis-gizmo snapping. No painting in this mode yet.
 //! Both modes share one yaw/pitch/radius state — "locked" only means
 //! "no free dragging", not "frozen direction"; clicking a gizmo ball (see
 //! gizmo.rs) re-points either mode at a cardinal axis, exactly like
-//! Blender's numpad views. Toggled via the egui button in ui.rs. Still
-//! part of the throwaway test scene, not the real canvas viewport — that
-//! comes later, once there's real content to look at and mid-math is
-//! wired in for the projection/picking math.
+//! Blender's numpad views.
 
 use mxross_math::{Mat4, Vec3};
 
@@ -34,8 +33,9 @@ const MIN_RADIUS: f32 = 1.0;
 const MAX_RADIUS: f32 = 20.0;
 
 /// `LockedOrtho`'s half-height as a fraction of `radius` — chosen so the
-/// default radius (4.0) reproduces the original hardcoded half-height
-/// (2.5).
+/// default radius (4.0) gives a half-height of 2.5, slightly larger than
+/// the paint canvas's own half-size (2.0) so the canvas doesn't fill the
+/// entire screen at default zoom (leaves room for the UI corners).
 const ORTHO_HALF_HEIGHT_FACTOR: f32 = 0.625;
 
 /// A cardinal world axis, as offered by the gizmo (gizmo.rs).
@@ -91,9 +91,8 @@ pub struct OrbitCamera {
 impl OrbitCamera {
     pub fn new() -> Self {
         Self {
-            // Front view by default — matches the original hardcoded
-            // LockedOrtho eye exactly, just expressed as yaw/pitch now
-            // that both modes share this state.
+            // Front view by default — the only orientation painting
+            // currently understands (see `is_front_view`).
             yaw: 0.0,
             pitch: 0.0,
             radius: 4.0,
@@ -142,6 +141,25 @@ impl OrbitCamera {
         self.pitch = pitch.to_radians();
     }
 
+    /// True when looking straight down -Z at the default front angle —
+    /// the only orientation `canvas.rs` currently knows how to map touch
+    /// input through (a simple orthographic unproject, not a general
+    /// ray-plane intersection). Snapping to Top/Side/Back via the gizmo
+    /// leaves `LockedOrtho` active but makes this false, which is what
+    /// currently disables painting from those angles.
+    pub fn is_front_view(&self) -> bool {
+        self.yaw.abs() < 0.001 && self.pitch.abs() < 0.001
+    }
+
+    /// Half-width/half-height of the LockedOrtho frustum at the given
+    /// aspect ratio — the same math `view_proj`'s LockedOrtho branch uses
+    /// internally, exposed so canvas.rs can map a front-view touch
+    /// position into world space.
+    pub fn ortho_half_extents(&self, aspect: f32) -> (f32, f32) {
+        let half_height = self.radius * ORTHO_HALF_HEIGHT_FACTOR;
+        (half_height * aspect, half_height)
+    }
+
     /// Short human-readable camera state, for the on-screen readout.
     pub fn readout(&self) -> String {
         match self.mode {
@@ -171,8 +189,7 @@ impl OrbitCamera {
     /// direction and `Y` become parallel, which makes `look_at_rh`'s
     /// internal cross product degenerate (NaN). Free-drag never reaches
     /// this (clamped to ±85°); only `snap_to_axis`'s exact ±90° top/
-    /// bottom views do, so this only ever matters right after a gizmo
-    /// click on the Y ball.
+    /// bottom views do.
     fn up_vector(&self) -> Vec3 {
         if self.pitch > 89.0_f32.to_radians() {
             Vec3::NEG_Z
@@ -184,9 +201,8 @@ impl OrbitCamera {
     }
 
     /// `(right, up, forward)` camera-space basis for the current view —
-    /// `forward` points from the eye toward the look-at target (i.e.
-    /// "into the screen"). Used by the gizmo to project world axes into
-    /// screen space without needing the full projection matrix. Same
+    /// `forward` points from the eye toward the look-at target. Used by
+    /// the gizmo to project world axes into screen space. Same
     /// cross-product order `Mat4::look_at_rh` uses internally, so this
     /// basis matches what's actually on screen.
     pub fn basis(&self) -> (Vec3, Vec3, Vec3) {
@@ -201,8 +217,7 @@ impl OrbitCamera {
         let view = Mat4::look_at_rh(self.eye(), Vec3::ZERO, self.up_vector());
         match self.mode {
             CameraMode::LockedOrtho => {
-                let half_height = self.radius * ORTHO_HALF_HEIGHT_FACTOR;
-                let half_width = half_height * aspect;
+                let (half_width, half_height) = self.ortho_half_extents(aspect);
                 let proj = Mat4::orthographic_rh(
                     -half_width, half_width, -half_height, half_height, 0.1, 100.0,
                 );
@@ -220,4 +235,4 @@ impl Default for OrbitCamera {
     fn default() -> Self {
         Self::new()
     }
-                }
+        }
