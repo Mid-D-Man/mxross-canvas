@@ -306,11 +306,11 @@ impl PaintCanvas {
     }
 
     /// Stamps one circular dab at `uv` (0..1, top-left origin). Does its
-    /// own one-off encoder + submit, independent of the main frame's —
-    /// simplest correct thing given stamps can arrive multiple times per
-    /// frame (one per touch-move sample) and each needs its own vertex
-    /// data; revisit only if per-stamp submit overhead actually shows up
-    /// as a real cost on device.
+    /// own one-off encoder + submit — simplest correct thing given dabs
+    /// can arrive several times per `try_stamp` call now (interpolated
+    /// by `stamp_segment` below) and each needs its own vertex data;
+    /// revisit (batch into one pass) only if per-stamp submit overhead
+    /// actually shows up as a real cost on device.
     pub fn stamp(&self, device: &wgpu::Device, queue: &wgpu::Queue, uv: (f32, f32), brush: &BrushSettings) {
         let center_ndc = [uv.0 * 2.0 - 1.0, 1.0 - uv.1 * 2.0];
         let radius_ndc = [
@@ -370,6 +370,50 @@ impl PaintCanvas {
         queue.submit(std::iter::once(encoder.finish()));
     }
 
+    /// Stamps evenly-spaced dabs (`brush.spacing * brush.radius_px`
+    /// apart, in canvas pixels) along the straight line from `from` to
+    /// `to`, leaving any leftover distance short of one full spacing
+    /// step for the next call to pick up — this is what turns a fast,
+    /// sparsely-sampled swipe into a continuous line instead of a row of
+    /// separated dots.
+    ///
+    /// `from = None` means "start of a stroke" — stamps once at `to`
+    /// with no interpolation (there's nothing to interpolate from yet)
+    /// and starts tracking from there.
+    ///
+    /// Returns where interpolation left off (NOT necessarily `to`
+    /// itself, since the last leg short of a full spacing step doesn't
+    /// get stamped) — pass that back in as `from` on the next call.
+    pub fn stamp_segment(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        from: Option<(f32, f32)>,
+        to: (f32, f32),
+        brush: &BrushSettings,
+    ) -> (f32, f32) {
+        let Some(mut cursor) = from else {
+            self.stamp(device, queue, to, brush);
+            return to;
+        };
+
+        // .max(1.0) guards against a zero/negative spacing value looping
+        // forever — 1 canvas pixel is the smallest step worth taking.
+        let spacing_px = (brush.radius_px * brush.spacing).max(1.0);
+
+        loop {
+            let dx = (to.0 - cursor.0) * TEXTURE_SIZE as f32;
+            let dy = (to.1 - cursor.1) * TEXTURE_SIZE as f32;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist < spacing_px {
+                return cursor;
+            }
+            let t = spacing_px / dist;
+            cursor = (cursor.0 + (to.0 - cursor.0) * t, cursor.1 + (to.1 - cursor.1) * t);
+            self.stamp(device, queue, cursor, brush);
+        }
+    }
+
     pub fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
         pass.set_pipeline(&self.display_pipeline);
         pass.set_bind_group(0, &self.display_bind_group, &[]);
@@ -406,4 +450,4 @@ pub fn screen_to_canvas_uv(
     } else {
         None
     }
-         }
+                }
