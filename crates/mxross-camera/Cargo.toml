@@ -1,0 +1,10 @@
+[package]
+name        = "mxross-camera"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["MidManStudio"]
+description = "MxRoss Canvas camera — locked-ortho/free-orbit viewport state, axis snapping. Pure math/state; no rendering or UI-framework knowledge."
+license     = "MIT"
+
+[dependencies]
+mxross-math = { path = "../mxross-math" }
