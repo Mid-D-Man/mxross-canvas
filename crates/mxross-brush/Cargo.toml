@@ -3,5 +3,5 @@ name        = "mxross-brush"
 version     = "0.1.0"
 edition     = "2021"
 authors     = ["MidManStudio"]
-description = "MxRoss Canvas brush engine — presets and stamping math, design pending"
+description = "MxRoss Canvas brush engine — DixScript-defined presets, stroke smoothing, spacing, and the Lua hook seam. No wgpu/rendering knowledge at all."
 license     = "MIT"
