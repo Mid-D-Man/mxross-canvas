@@ -8,6 +8,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
+
+# Math primitives
+mxross-math = { path = "../mxross-math" }
+
 # mxross-ffi (not mxross-canvas-core directly) — reuses init_logger() and is
 # the right place for the eventual C-ABI surface too.
 mxross-ffi = { path = "../mxross-ffi" }
@@ -23,6 +27,7 @@ mxross-brush = { path = "../mxross-brush" }
 mxross-interaction = { path = "../mxross-interaction" }
 # GPU rendering: the paint canvas texture + pipelines.
 mxross-render-gpu = { path = "../mxross-render-gpu" }
+
 # Needed explicitly so we can name HardwareBufferFormat/NativeWindow in our
 # own code — android-activity depends on the same ndk 0.9, so this resolves
 # to one shared copy in the dependency graph, not a duplicate.
