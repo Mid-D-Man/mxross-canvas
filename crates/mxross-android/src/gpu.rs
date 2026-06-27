@@ -1,8 +1,14 @@
 // crates/mxross-android/src/gpu.rs
 //! wgpu GPU render path for MxRoss Canvas on Android — Instance -> Surface
 //! -> Adapter -> Device -> Queue, then one depth-tested render pass per
-//! frame drawing the paint canvas (canvas.rs) from the camera (camera.rs)
-//! followed by the egui UI (ui.rs) drawn flat on top.
+//! frame drawing the paint canvas (mxross-render-gpu), with all pointer
+//! routing (orbit/zoom/paint) handled by mxross-interaction's
+//! `CanvasController`, and the egui UI (ui.rs) drawn flat on top.
+//!
+//! This is the one file in the whole app allowed to know about both
+//! `mxross-brush` (for the `DabPlan` type) and `mxross-render-gpu` (for
+//! `Dab`) — that's deliberate, not an oversight. Converting one into the
+//! other happens exactly once, in `apply_dabs` below.
 //!
 //! ## The HasDisplayHandle gap
 //!
@@ -28,9 +34,10 @@ use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, WindowHandle,
 };
 
-use crate::brush::BrushSettings;
-use crate::camera::{CameraMode, OrbitCamera};
-use crate::canvas::{self, PaintCanvas};
+use mxross_brush::DabPlan;
+use mxross_interaction::CanvasController;
+use mxross_render_gpu::{Dab, PaintCanvas};
+
 use crate::ui::AppUi;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -67,37 +74,17 @@ pub struct GpuState {
     config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
     canvas: PaintCanvas,
-    camera: OrbitCamera,
-    brush: BrushSettings,
+    controller: CanvasController,
     ui: AppUi,
     egui_renderer: egui_wgpu::Renderer,
     pending_ui_events: Vec<egui::Event>,
-    /// Last single-finger touch position, in window pixel coordinates.
-    /// None whenever no finger is down.
-    last_touch: Option<(f32, f32)>,
-    /// Distance between the first two active pointers, in pixels, as of
-    /// the last `touch_move` call. None whenever fewer than two fingers
-    /// are down.
-    last_pinch_distance: Option<f32>,
-    /// True for the duration of a single-finger stroke that started
-    /// somewhere paintable. Set on `touch_down`, cleared on `touch_up`
-    /// and on `second_touch_down` — that second case matters: without
-    /// it, a second finger landing mid-stroke (to start a pinch) would
-    /// otherwise leave one stray dab at wherever the first finger
-    /// happened to be.
-    is_painting: bool,
-    /// Canvas UV of the last dab actually stamped this stroke — NOT the
-    /// same as `last_touch` (which is in screen pixels and updates every
-    /// sample regardless of painting). Feeds `PaintCanvas::stamp_segment`
-    /// so fast strokes get filled in instead of leaving gaps. Reset to
-    /// `None` at the start of every new stroke.
-    last_stamp_uv: Option<(f32, f32)>,
 }
 
 impl GpuState {
     /// Builds the full Instance -> Surface -> Adapter -> Device chain for
     /// `window`, configures the surface, and creates the depth buffer,
-    /// paint canvas, and egui renderer at its current size.
+    /// paint canvas, interaction controller, and egui renderer at its
+    /// current size.
     pub fn new(window: NativeWindow) -> Result<Self, String> {
         pollster::block_on(Self::new_async(window))
     }
@@ -150,6 +137,11 @@ impl GpuState {
 
         let depth_view = Self::create_depth_view(&device, width, height);
         let canvas = PaintCanvas::new(&device, &queue, config.format, DEPTH_FORMAT);
+        let controller = CanvasController::new(
+            canvas.half_size(),
+            canvas.texture_size_px(),
+            (width as f32, height as f32),
+        );
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,
             config.format,
@@ -166,15 +158,10 @@ impl GpuState {
             config,
             depth_view,
             canvas,
-            camera: OrbitCamera::new(),
-            brush: BrushSettings::default_ink(),
+            controller,
             ui: AppUi::new(),
             egui_renderer,
             pending_ui_events: Vec::new(),
-            last_touch: None,
-            last_pinch_distance: None,
-            is_painting: false,
-            last_stamp_uv: None,
         })
     }
 
@@ -192,8 +179,9 @@ impl GpuState {
         texture.create_view(&wgpu::TextureViewDescriptor::default())
     }
 
-    /// Re-applies the config and rebuilds the depth buffer at a new size.
-    /// Wired up to Android's `WindowResized` event (see lib.rs).
+    /// Re-applies the config, rebuilds the depth buffer, and tells the
+    /// controller about the new size. Wired up to Android's
+    /// `WindowResized` event (see lib.rs).
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -202,35 +190,20 @@ impl GpuState {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.depth_view = Self::create_depth_view(&self.device, width, height);
+        self.controller.resize(width as f32, height as f32);
     }
 
-    fn can_paint(&self) -> bool {
-        self.camera.mode() == CameraMode::LockedOrtho && self.camera.is_front_view()
-    }
-
-    /// Maps `(x, y)` to canvas UV and stamps a spacing-interpolated
-    /// segment from `last_stamp_uv` to there, updating `last_stamp_uv` to
-    /// wherever interpolation left off.
-    fn try_stamp(&mut self, x: f32, y: f32) {
-        let aspect = self.config.width as f32 / self.config.height as f32;
-        let ortho_extents = self.camera.ortho_half_extents(aspect);
-        if let Some(uv) = canvas::screen_to_canvas_uv(
-            x,
-            y,
-            self.config.width as f32,
-            self.config.height as f32,
-            ortho_extents,
-            self.canvas.half_size(),
-        ) {
-            let cursor = self.canvas.stamp_segment(
-                &self.device,
-                &self.queue,
-                self.last_stamp_uv,
-                uv,
-                &self.brush,
-            );
-            self.last_stamp_uv = Some(cursor);
+    /// Converts mxross-brush's `DabPlan`s into mxross-render-gpu's
+    /// `Dab`s and draws them — the one place both types are named.
+    fn apply_dabs(&self, plans: Vec<DabPlan>) {
+        if plans.is_empty() {
+            return;
         }
+        let dabs: Vec<Dab> = plans
+            .into_iter()
+            .map(|p| Dab { position: p.position, radius_px: p.radius_px, color: p.color })
+            .collect();
+        self.canvas.stamp_many(&self.device, &self.queue, &dabs);
     }
 
     /// `x`/`y` are raw window pixel coordinates — converted to egui
@@ -244,64 +217,27 @@ impl GpuState {
             pressed: true,
             modifiers: egui::Modifiers::NONE,
         });
-        self.last_touch = Some((x, y));
-        // Every new stroke starts fresh — without this, the first dab of
-        // a new stroke would interpolate a stray line connecting it back
-        // to wherever the *previous* stroke ended.
-        self.last_stamp_uv = None;
-
-        // One-frame-stale pointer_over_ui — same accepted caveat as
-        // camera-drag arbitration: tapping directly on a UI element
-        // could in principle leave one stray dab before egui catches up
-        // the following frame. The canvas doesn't reach the screen
-        // corners where the UI lives at default zoom, so this is a
-        // narrow edge case, not a constant annoyance.
-        self.is_painting = self.can_paint() && !self.ui.pointer_over_ui();
-        if self.is_painting {
-            self.try_stamp(x, y);
-        }
+        let plans = self.controller.pointer_down(x, y, self.ui.pointer_over_ui());
+        self.apply_dabs(plans);
     }
 
     /// A second finger touched down — treated as the start of a pinch,
-    /// not painting. Cancels any in-progress stroke so the pinch doesn't
-    /// leave a stray dab where the first finger happened to be.
+    /// not painting.
     pub fn second_touch_down(&mut self) {
-        self.is_painting = false;
-        self.last_stamp_uv = None;
+        self.controller.second_pointer_down();
     }
 
     /// `pointers` are ALL currently active touches, in window pixel
-    /// coordinates. egui only ever sees the first one (it has no concept
-    /// of multi-touch); two pointers drive pinch-to-zoom instead of
-    /// painting or camera orbit.
+    /// coordinates.
     pub fn touch_move(&mut self, pointers: &[(f32, f32)], pixels_per_point: f32) {
-        let Some(&(x, y)) = pointers.first() else { return };
-
-        self.pending_ui_events.push(egui::Event::PointerMoved(egui::pos2(
-            x / pixels_per_point,
-            y / pixels_per_point,
-        )));
-
-        if pointers.len() >= 2 {
-            let (x1, y1) = pointers[1];
-            let distance = ((x1 - x).powi(2) + (y1 - y).powi(2)).sqrt();
-            if let Some(last) = self.last_pinch_distance {
-                self.camera.zoom(distance / last.max(1.0));
-            }
-            self.last_pinch_distance = Some(distance);
-            self.is_painting = false;
-        } else {
-            self.last_pinch_distance = None;
-            if self.is_painting {
-                self.try_stamp(x, y);
-            } else if let Some((lx, ly)) = self.last_touch {
-                if !self.ui.pointer_over_ui() {
-                    self.camera.handle_drag(x - lx, y - ly);
-                }
-            }
+        if let Some(&(x, y)) = pointers.first() {
+            self.pending_ui_events.push(egui::Event::PointerMoved(egui::pos2(
+                x / pixels_per_point,
+                y / pixels_per_point,
+            )));
         }
-
-        self.last_touch = Some((x, y));
+        let plans = self.controller.pointer_moved(pointers, self.ui.pointer_over_ui());
+        self.apply_dabs(plans);
     }
 
     pub fn touch_up(&mut self, x: f32, y: f32, pixels_per_point: f32) {
@@ -312,21 +248,19 @@ impl GpuState {
             modifiers: egui::Modifiers::NONE,
         });
         self.pending_ui_events.push(egui::Event::PointerGone);
-        self.last_touch = None;
-        self.last_pinch_distance = None;
-        self.is_painting = false;
-        self.last_stamp_uv = None;
+        let plans = self.controller.pointer_up(x, y);
+        self.apply_dabs(plans);
     }
 
     /// Clears to `clear_color`, depth-tests the canvas plane, then draws
     /// the egui UI flat on top.
     pub fn render(&mut self, clear_color: wgpu::Color, pixels_per_point: f32) {
         let aspect = self.config.width as f32 / self.config.height as f32;
-        self.canvas.set_camera(&self.queue, self.camera.view_proj(aspect));
+        self.canvas.set_camera(&self.queue, self.controller.camera().view_proj(aspect));
 
         let events = std::mem::take(&mut self.pending_ui_events);
         let output = self.ui.run_frame(
-            &mut self.camera,
+            self.controller.camera_mut(),
             events,
             (self.config.width, self.config.height),
             pixels_per_point,
@@ -407,4 +341,4 @@ impl GpuState {
             self.egui_renderer.free_texture(id);
         }
     }
-                }
+            }
