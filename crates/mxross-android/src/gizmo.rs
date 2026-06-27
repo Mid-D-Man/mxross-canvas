@@ -3,7 +3,7 @@
 //! projecting world axis directions through the camera's current
 //! rotation. Clicking one snaps the camera to look directly down that
 //! axis. Works in both camera modes — they share one yaw/pitch state,
-//! see camera.rs.
+//! see mxross-camera.
 //!
 //! Pure `egui::Painter` drawing, not a real 3D-rendered widget — this is
 //! the standard trick every editor gizmo like this uses: take the
@@ -14,7 +14,7 @@
 
 use mxross_math::Vec3;
 
-use crate::camera::Axis;
+use mxross_camera::Axis;
 
 const SIZE: f32 = 120.0;
 const RADIUS: f32 = 45.0;
@@ -72,4 +72,4 @@ pub fn show(ui: &mut egui::Ui, basis: (Vec3, Vec3, Vec3)) -> Option<Axis> {
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|&(axis, ..)| axis)
-     }
+    }
