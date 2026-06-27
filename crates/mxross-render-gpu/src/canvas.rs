@@ -4,10 +4,19 @@
 //! GPU render pass (`LoadOp::Load`, so existing paint persists).
 //!
 //! This struct does exactly one job: given a list of dabs (where, how
-//! big, what color), draw them. It has no concept of strokes, spacing,
-//! smoothing, or presets — that's all `mxross-brush`'s job now. The
-//! caller (`mxross-android`'s gpu.rs) is responsible for turning a
-//! stroke into a `&[Dab]` before calling `stamp_many`.
+//! big, what color), draw them — plus, now, read the result back to CPU
+//! memory for export. It has no concept of strokes, spacing, smoothing,
+//! presets, or file formats — that's `mxross-brush` and `mxross-export`'s
+//! jobs respectively.
+//!
+//! The canvas starts fully transparent (not white) — unpainted areas
+//! have alpha 0, which matters for export (a drawing surface with an
+//! opaque white background can't ever produce a transparent PNG, no
+//! matter what the export step does) and, just as importantly, for how
+//! it displays in the 3D scene: the display pipeline blends with
+//! `ALPHA_BLENDING`, not `REPLACE`, specifically so transparent canvas
+//! pixels let the scene's background show through instead of painting
+//! solid black where nothing's been drawn.
 
 use wgpu::util::DeviceExt;
 
@@ -21,7 +30,7 @@ const CANVAS_HALF_SIZE: f32 = 2.0;
 /// One dab to draw: where (canvas UV, 0..1, top-left origin), how big
 /// (canvas texture pixels), what color. Plain data — no brush concepts
 /// attached. `mxross-brush`'s `DabPlan` has the same shape; the two
-/// types stay separate on purpose (see module doc comment).
+/// types stay separate on purpose (see crate doc comment).
 #[derive(Clone, Copy)]
 pub struct Dab {
     pub position: (f32, f32),
@@ -51,6 +60,7 @@ struct CameraUniform {
 }
 
 pub struct PaintCanvas {
+    texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
     display_pipeline: wgpu::RenderPipeline,
     display_vertex_buffer: wgpu::Buffer,
@@ -74,12 +84,16 @@ impl PaintCanvas {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Blank white canvas to start — one clear-only pass, no draws.
+        // Fully transparent to start — NOT white. See struct doc comment
+        // for why this matters both for export and for how the canvas
+        // displays in-app.
         let mut clear_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("paint canvas clear encoder"),
         });
@@ -91,7 +105,7 @@ impl PaintCanvas {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -198,7 +212,12 @@ impl PaintCanvas {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    // ALPHA_BLENDING, not REPLACE — see struct doc
+                    // comment. Without this, a transparent canvas would
+                    // render as solid black in-app wherever nothing's
+                    // been painted, instead of showing the scene
+                    // background through it.
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -286,6 +305,7 @@ impl PaintCanvas {
         });
 
         Self {
+            texture,
             texture_view,
             display_pipeline,
             display_vertex_buffer,
@@ -317,15 +337,10 @@ impl PaintCanvas {
     /// abstract 0..1 UV fractions.
     pub fn texture_size_px(&self) -> f32 {
         TEXTURE_SIZE as f32
-          }
+    }
 
     /// Stamps every dab in `dabs` in one render pass — one encoder, one
-    /// vertex/index buffer covering the whole batch, one submit. This is
-    /// the thing that changed from the original per-dab version: a
-    /// single `touch_move` can now produce many dabs at once (smoothing
-    /// + spacing both live in `mxross-brush` now), so batching them
-    /// avoids a submit-per-dab cost that used to be hidden by there only
-    /// ever being one dab per call.
+    /// vertex/index buffer covering the whole batch, one submit.
     pub fn stamp_many(&self, device: &wgpu::Device, queue: &wgpu::Queue, dabs: &[Dab]) {
         if dabs.is_empty() {
             return;
@@ -394,5 +409,74 @@ impl PaintCanvas {
         pass.set_vertex_buffer(0, self.display_vertex_buffer.slice(..));
         pass.set_index_buffer(self.display_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         pass.draw_indexed(0..6, 0, 0..1);
+    }
+
+    /// Reads the canvas texture back to CPU memory as tightly-packed
+    /// RGBA8 (no row padding in the result, even though the GPU copy
+    /// itself requires 256-byte-aligned rows — that padding is stripped
+    /// here so callers never need to know it exists). Returns
+    /// `(width, height, pixels)`.
+    ///
+    /// Blocks the calling thread until the copy completes — this is a
+    /// rare, user-triggered action (export), not something called every
+    /// frame, so a blocking wait is the right tradeoff over async
+    /// plumbing here.
+    pub fn read_pixels(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> (u32, u32, Vec<u8>) {
+        const BYTES_PER_PIXEL: u32 = 4; // Rgba8Unorm
+
+        let unpadded_bytes_per_row = TEXTURE_SIZE * BYTES_PER_PIXEL;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
+
+        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("paint canvas readback buffer"),
+            size: (padded_bytes_per_row * TEXTURE_SIZE) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("paint canvas readback encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            self.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &output_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(TEXTURE_SIZE),
+                },
+            },
+            wgpu::Extent3d { width: TEXTURE_SIZE, height: TEXTURE_SIZE, depth_or_array_layers: 1 },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let buffer_slice = output_buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+        // Blocks until the copy (and the map_async callback above) have
+        // both completed.
+        device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .expect("device poll failed during canvas readback");
+        rx.recv()
+            .expect("map_async callback never fired")
+            .expect("buffer mapping failed");
+
+        let mapped = buffer_slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity((unpadded_bytes_per_row * TEXTURE_SIZE) as usize);
+        for row in 0..TEXTURE_SIZE {
+            let start = (row * padded_bytes_per_row) as usize;
+            let end = start + unpadded_bytes_per_row as usize;
+            pixels.extend_from_slice(&mapped[start..end]);
+        }
+        drop(mapped);
+        output_buffer.unmap();
+
+        (TEXTURE_SIZE, TEXTURE_SIZE, pixels)
     }
 }
