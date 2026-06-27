@@ -1,0 +1,11 @@
+[package]
+name        = "mxross-interaction"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["MidManStudio"]
+description = "MxRoss Canvas interaction layer — routes raw pointer events to camera orbit/zoom or brush strokes. Plain f32 coordinates in, DabPlans out; no platform, windowing, or UI-framework knowledge at all."
+license     = "MIT"
+
+[dependencies]
+mxross-camera = { path = "../mxross-camera" }
+mxross-brush  = { path = "../mxross-brush" }
