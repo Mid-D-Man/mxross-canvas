@@ -5,15 +5,16 @@
 //! there's no egui-winit glue to lean on — touch events are translated
 //! into `egui::Event`s by hand in gpu.rs and fed in here directly.
 //!
-//! Builds three widgets right now: the mode toggle, the camera readout,
-//! and the axis gizmo (gizmo.rs). As more UI lands, this is the natural
-//! place to split "egui plumbing" from "the actual widgets" — doing that
-//! split now would still be guessing at the wrong abstraction with only
-//! three widgets to learn from.
+//! Builds two widgets right now (mode toggle + camera readout) plus the
+//! axis gizmo (gizmo.rs). As more UI lands, this is the natural place to
+//! split "egui plumbing" from "the actual widgets" — doing that split
+//! now would still be guessing at the wrong abstraction with only a
+//! couple of widgets to learn from.
 
 use std::time::Instant;
 
-use crate::camera::{CameraMode, OrbitCamera};
+use mxross_camera::{CameraMode, OrbitCamera};
+
 use crate::gizmo;
 
 pub struct AppUi {
@@ -36,10 +37,11 @@ impl AppUi {
     }
 
     /// True if egui claimed the pointer this frame (hovering/dragging a
-    /// widget) — checked by GpuState before applying camera-orbit drag
-    /// deltas, so dragging on a widget doesn't also spin the camera
-    /// underneath it. One-frame-stale by construction (reflects the
-    /// previous call to `run_frame`).
+    /// widget) — checked by GpuState (via mxross-interaction's
+    /// `CanvasController`) before applying camera-orbit drag deltas, so
+    /// dragging on a widget doesn't also spin the camera underneath it.
+    /// One-frame-stale by construction (reflects the previous call to
+    /// `run_frame`).
     pub fn pointer_over_ui(&self) -> bool {
         self.pointer_over_ui
     }
@@ -120,4 +122,4 @@ impl Default for AppUi {
     fn default() -> Self {
         Self::new()
     }
-    }
+            }
