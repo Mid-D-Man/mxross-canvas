@@ -1,0 +1,13 @@
+[package]
+name        = "mxross-export"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["MidManStudio"]
+description = "MxRoss Canvas export — encodes raw RGBA8 pixel buffers into output file formats, starting with PNG. Pure data transformation; no GPU, platform, or windowing knowledge. Natural future home for an MPX export path alongside PNG."
+license     = "MIT"
+
+[dependencies]
+# Pure Rust by default — its flate2 dependency defaults to the
+# rust_backend feature (miniz_oxide), not C zlib. Verified directly
+# against the dependency graph, not assumed.
+png = "0.18"
