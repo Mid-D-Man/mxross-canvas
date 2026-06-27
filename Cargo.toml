@@ -8,6 +8,7 @@ members = [
     "crates/mxross-render-gpu",
     "crates/mxross-camera",
     "crates/mxross-interaction",
+    "crates/mxross-export",
     "crates/mxross-document",
     "crates/mxross-brush",
     "crates/mxross-ffi",
