@@ -176,7 +176,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mxross-app-android
-          path: target/**/apk/*.apk
+          path: |
+            target/**/apk/*.apk
+            !target/**/apk/*-unaligned.apk
 
       - name: Upload status
         if: always()
