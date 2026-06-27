@@ -11,33 +11,30 @@ android-activity = { version = "0.6", features = ["native-activity"] }
 # mxross-ffi (not mxross-canvas-core directly) — reuses init_logger() and is
 # the right place for the eventual C-ABI surface too.
 mxross-ffi = { path = "../mxross-ffi" }
-# Math for the camera (perspective/orthographic + look_at) — same
-# glam-backed facade the rest of the canvas pipeline uses.
-mxross-math = { path = "../mxross-math" }
+# Camera type itself — ui.rs/gizmo.rs reference OrbitCamera/CameraMode/Axis
+# directly for widget state, even though gpu.rs only ever touches the
+# camera indirectly through mxross-interaction's controller.
+mxross-camera = { path = "../mxross-camera" }
+# DabPlan — the one brush type gpu.rs still needs by name, to convert
+# into mxross-render-gpu's Dab. Everything else brush-related (preset,
+# engine, smoothing) is now fully internal to mxross-interaction.
+mxross-brush = { path = "../mxross-brush" }
+# The interaction layer: routes pointer events to orbit/zoom/paint.
+mxross-interaction = { path = "../mxross-interaction" }
+# GPU rendering: the paint canvas texture + pipelines.
+mxross-render-gpu = { path = "../mxross-render-gpu" }
 # Needed explicitly so we can name HardwareBufferFormat/NativeWindow in our
 # own code — android-activity depends on the same ndk 0.9, so this resolves
 # to one shared copy in the dependency graph, not a duplicate.
 ndk = "0.9"
-# GPU render path. ndk's default `rwh_06` feature and wgpu's own
-# raw-window-handle requirement both resolve to the SAME raw-window-handle
-# 0.6.x in the dependency graph.
 wgpu = "29.0"
 raw-window-handle = "0.6"
 # Drives wgpu's async instance/adapter/device setup synchronously inside
 # the android_main poll loop — no async runtime needed for anything else.
 pollster = "0.4"
-# Vertex/index/uniform buffer contents for the test cube.
-bytemuck = { version = "1", features = ["derive"] }
-# log::error!/log::warn! etc. — android_logger (set up by
-# mxross_ffi::init_logger) is the *backend*; this crate still needs `log`
-# itself as a direct dependency to use its macros.
 log = "0.4"
 # UI layer — the real foundation for every future UI element (tool
-# palette, layers panel, brush settings, ...), not just this one toggle.
-# No winit anywhere in this app, so egui-wgpu's default features are used
-# as-is — its optional "winit" feature (glue for winit's event loop) is
-# never enabled and isn't needed: touch events are translated into
-# egui::Event by hand in gpu.rs.
+# palette, layers panel, brush settings, ...).
 egui = "0.34"
 egui-wgpu = "0.34"
 
