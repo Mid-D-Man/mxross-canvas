@@ -1,9 +1,6 @@
 // crates/mxross-android/src/lib.rs
 //! MxRoss Canvas — Android entry point.
 
-mod brush;
-mod camera;
-mod canvas;
 mod gizmo;
 mod gpu;
 mod ui;
@@ -80,8 +77,9 @@ fn android_main(app: AndroidApp) {
         let pixels_per_point = app.config().density().unwrap_or(160) as f32 / 160.0;
 
         // Down (first finger) and PointerDown (an additional finger) are
-        // handled separately on purpose — see GpuState::second_touch_down's
-        // doc comment for why collapsing them caused a stray-dab bug.
+        // handled separately on purpose — see
+        // CanvasController::second_pointer_down's doc comment for why
+        // collapsing them caused a stray-dab bug.
         if let Ok(mut iter) = app.input_events_iter() {
             loop {
                 let has_more = iter.next(|event| {
@@ -122,4 +120,4 @@ fn android_main(app: AndroidApp) {
             state.render(BACKGROUND, pixels_per_point);
         }
     }
-                       }
+    }
