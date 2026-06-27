@@ -1,0 +1,12 @@
+[package]
+name        = "mxross-render-gpu"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["MidManStudio"]
+description = "MxRoss Canvas GPU rendering — paint canvas texture, dab compositing. Knows wgpu, knows nothing about brushes, strokes, presets, or windows/Surface."
+license     = "MIT"
+
+[dependencies]
+wgpu        = "29.0"
+bytemuck    = { version = "1", features = ["derive"] }
+mxross-math = { path = "../mxross-math" }
