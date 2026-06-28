@@ -41,9 +41,6 @@ use crate::ui::AppUi;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// Bundles a `NativeWindow` with the (empty) Android display handle.
-/// Takes ownership of the window — wgpu's `Surface` keeps this alive
-/// internally for as long as the surface itself lives.
 struct WindowHandles {
     native_window: NativeWindow,
 }
@@ -60,13 +57,6 @@ impl HasDisplayHandle for WindowHandles {
     }
 }
 
-/// Everything needed to render a frame. Rebuilt from scratch on every
-/// Android `InitWindow` event and torn down on `TerminateWindow` (see
-/// lib.rs) — which means camera mode, the paint canvas, background mode,
-/// and egui's internal state all reset on a window swap. Acceptable for
-/// now; revisit (the canvas especially — losing a painting on
-/// backgrounding would actually be bad) once there's a real save/load
-/// path.
 pub struct GpuState {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -79,10 +69,6 @@ pub struct GpuState {
     ui: AppUi,
     egui_renderer: egui_wgpu::Renderer,
     pending_ui_events: Vec<egui::Event>,
-    /// Filled in by `render` when the export button was clicked, taken
-    /// (and written to disk) by lib.rs's main loop right after —
-    /// GpuState has no filesystem-path knowledge of its own (that's
-    /// `AndroidApp::external_data_path`, which lives in lib.rs).
     pending_export: Option<Vec<u8>>,
 }
 
@@ -240,11 +226,6 @@ impl GpuState {
         self.apply_dabs(plans);
     }
 
-    /// Reads the canvas back and encodes it as PNG bytes, honoring the
-    /// current background mode: transparent stays transparent, solid
-    /// gets flattened onto that color first — matches whatever the live
-    /// preview is currently showing, not silently always one or the
-    /// other.
     fn export_png(&self) -> Result<Vec<u8>, String> {
         let (width, height, rgba) = self.canvas.read_pixels(&self.device, &self.queue);
         let pixels = match self.background_mode {
@@ -257,11 +238,15 @@ impl GpuState {
         mxross_export::encode_png(width, height, &pixels)
     }
 
-    /// Takes whatever PNG bytes `render` produced this frame, if any.
-    /// Called by lib.rs right after `render`, which is the only place
-    /// that knows how to turn this into an actual file on disk.
     pub fn take_pending_export(&mut self) -> Option<Vec<u8>> {
         self.pending_export.take()
+    }
+
+    /// Called by lib.rs right after it's tried (and either succeeded or
+    /// failed) to write a pending export to disk — the actual,
+    /// real-or-not confirmation you can see without logcat.
+    pub fn set_export_status(&mut self, status: String) {
+        self.ui.set_export_status(status);
     }
 
     pub fn render(&mut self, clear_color: wgpu::Color, pixels_per_point: f32) {
@@ -288,7 +273,10 @@ impl GpuState {
         if self.ui.take_export_request() {
             match self.export_png() {
                 Ok(bytes) => self.pending_export = Some(bytes),
-                Err(e) => log::error!("PNG export failed: {e}"),
+                Err(e) => {
+                    log::error!("PNG export failed: {e}");
+                    self.ui.set_export_status(format!("Export failed: {e}"));
+                }
             }
         }
 
@@ -368,4 +356,4 @@ impl GpuState {
             self.egui_renderer.free_texture(id);
         }
     }
-        }
+                                 }
