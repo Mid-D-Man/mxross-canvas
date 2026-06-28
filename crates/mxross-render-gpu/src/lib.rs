@@ -11,4 +11,4 @@
 
 pub mod canvas;
 
-pub use canvas::{Dab, PaintCanvas};
+pub use canvas::{BackgroundMode, Dab, PaintCanvas};
