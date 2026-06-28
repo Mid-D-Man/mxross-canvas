@@ -16,6 +16,12 @@ pub struct AppUi {
     pointer_over_ui: bool,
     background_toggle_requested: bool,
     export_requested: bool,
+    /// The actual result of the last export attempt — set from outside
+    /// (gpu.rs, after lib.rs has tried writing the file) since this is
+    /// the only place with no other way to surface that to you without
+    /// logcat. Persists until the next export attempt overwrites it;
+    /// no auto-clear timer, simplest thing that gives a real answer.
+    last_export_status: Option<String>,
     start: Instant,
 }
 
@@ -26,6 +32,7 @@ impl AppUi {
             pointer_over_ui: false,
             background_toggle_requested: false,
             export_requested: false,
+            last_export_status: None,
             start: Instant::now(),
         }
     }
@@ -34,9 +41,6 @@ impl AppUi {
         &self.ctx
     }
 
-    /// True if egui claimed the pointer this frame (hovering/dragging a
-    /// widget). One-frame-stale by construction (reflects the previous
-    /// call to `run_frame`).
     pub fn pointer_over_ui(&self) -> bool {
         self.pointer_over_ui
     }
@@ -47,6 +51,13 @@ impl AppUi {
 
     pub fn take_export_request(&mut self) -> bool {
         std::mem::take(&mut self.export_requested)
+    }
+
+    /// Called from gpu.rs once the actual file write (done in lib.rs,
+    /// which is the only place that knows the Android storage path) has
+    /// either succeeded or failed.
+    pub fn set_export_status(&mut self, status: String) {
+        self.last_export_status = Some(status);
     }
 
     pub fn run_frame(
@@ -71,11 +82,6 @@ impl AppUi {
             ..Default::default()
         };
 
-        // Read everything before the closure, apply any resulting
-        // changes after it returns — see earlier comments on why
-        // (capturing `camera` itself inside the closure while also
-        // wanting to read it for labels would fight the borrow checker
-        // for no real benefit).
         let mode = camera.mode();
         let readout = camera.readout();
         let basis = camera.basis();
@@ -83,6 +89,7 @@ impl AppUi {
             BackgroundMode::Transparent => "Background: None",
             BackgroundMode::Solid(_) => "Background: White",
         };
+        let export_status = self.last_export_status.clone();
         let mut clicked_toggle = false;
         let mut clicked_axis = None;
         let mut clicked_background = false;
@@ -123,6 +130,23 @@ impl AppUi {
                     }
                 });
 
+            if let Some(status) = &export_status {
+                egui::Area::new(egui::Id::new("export_status"))
+                    .fixed_pos(egui::pos2(16.0, 176.0))
+                    .show(ui.ctx(), |ui| {
+                        // Background panel, not just bare text — a plain
+                        // label here would be invisible against a busy
+                        // painted canvas behind it.
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_black_alpha(180))
+                            .corner_radius(4.0)
+                            .inner_margin(6.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(status).color(egui::Color32::WHITE));
+                            });
+                    });
+            }
+
             egui::Area::new(egui::Id::new("camera_gizmo"))
                 .fixed_pos(egui::pos2(screen_size_points.x - 136.0, 16.0))
                 .show(ui.ctx(), |ui| {
@@ -153,4 +177,4 @@ impl Default for AppUi {
     fn default() -> Self {
         Self::new()
     }
-    }
+            }
