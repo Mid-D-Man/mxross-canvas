@@ -11,7 +11,8 @@ android-activity = { version = "0.6", features = ["native-activity"] }
 
 # Math primitives
 mxross-math = { path = "../mxross-math" }
-
+# Encodes the canvas readback into a PNG for export.
+mxross-export = { path = "../mxross-export" }
 # mxross-ffi (not mxross-canvas-core directly) — reuses init_logger() and is
 # the right place for the eventual C-ABI surface too.
 mxross-ffi = { path = "../mxross-ffi" }
