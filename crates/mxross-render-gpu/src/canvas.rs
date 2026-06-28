@@ -3,20 +3,16 @@
 //! Painting is stamping circular dabs directly into its texture via a
 //! GPU render pass (`LoadOp::Load`, so existing paint persists).
 //!
-//! This struct does exactly one job: given a list of dabs (where, how
-//! big, what color), draw them — plus, now, read the result back to CPU
-//! memory for export. It has no concept of strokes, spacing, smoothing,
-//! presets, or file formats — that's `mxross-brush` and `mxross-export`'s
-//! jobs respectively.
-//!
-//! The canvas starts fully transparent (not white) — unpainted areas
-//! have alpha 0, which matters for export (a drawing surface with an
-//! opaque white background can't ever produce a transparent PNG, no
-//! matter what the export step does) and, just as importantly, for how
-//! it displays in the 3D scene: the display pipeline blends with
-//! `ALPHA_BLENDING`, not `REPLACE`, specifically so transparent canvas
-//! pixels let the scene's background show through instead of painting
-//! solid black where nothing's been drawn.
+//! The canvas texture itself always stores true alpha (transparent
+//! where unpainted) — that never changes, since it's what makes export
+//! possible at all. `BackgroundMode` is purely a *presentation* setting:
+//! it controls what the display pipeline composites the true-alpha
+//! canvas against (a checkerboard — the universal "this is actually
+//! transparent" convention every painting app uses, not a literal void —
+//! or a solid color), and the caller is expected to use that same mode
+//! to decide whether export should flatten onto a color
+//! (`mxross_export::flatten_onto`) or keep transparency as-is. The
+//! underlying pixel data is identical either way.
 
 use wgpu::util::DeviceExt;
 
@@ -36,6 +32,29 @@ pub struct Dab {
     pub position: (f32, f32),
     pub radius_px: f32,
     pub color: [f32; 4],
+}
+
+/// What the display pipeline composites the canvas against. Doesn't
+/// touch the underlying canvas data at all — see module doc comment.
+#[derive(Clone, Copy, PartialEq)]
+pub enum BackgroundMode {
+    /// Shown as a checkerboard, the standard "actually transparent, not
+    /// a dark void" indicator.
+    Transparent,
+    Solid([f32; 3]),
+}
+
+impl BackgroundMode {
+    pub fn white() -> Self {
+        BackgroundMode::Solid([1.0, 1.0, 1.0])
+    }
+
+    fn as_uniform(self) -> [f32; 4] {
+        match self {
+            BackgroundMode::Transparent => [0.0, 0.0, 0.0, 0.0],
+            BackgroundMode::Solid([r, g, b]) => [r, g, b, 1.0],
+        }
+    }
 }
 
 #[repr(C)]
@@ -59,6 +78,15 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
 
+/// `.rgb` = solid color (ignored in transparent mode), `.a` = mode flag
+/// (0.0 = transparent/checkerboard, 1.0 = solid) — packed as one vec4 to
+/// avoid any WGSL uniform-struct alignment/padding questions entirely.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct BackgroundUniform {
+    data: [f32; 4],
+}
+
 pub struct PaintCanvas {
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
@@ -67,6 +95,7 @@ pub struct PaintCanvas {
     display_index_buffer: wgpu::Buffer,
     display_bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
+    background_buffer: wgpu::Buffer,
     stamp_pipeline: wgpu::RenderPipeline,
 }
 
@@ -91,9 +120,8 @@ impl PaintCanvas {
         });
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Fully transparent to start — NOT white. See struct doc comment
-        // for why this matters both for export and for how the canvas
-        // displays in-app.
+        // Fully transparent to start — true alpha, never changes
+        // regardless of BackgroundMode. See struct doc comment.
         let mut clear_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("paint canvas clear encoder"),
         });
@@ -136,6 +164,14 @@ impl PaintCanvas {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        let background_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("paint canvas background buffer"),
+            contents: bytemuck::cast_slice(&[BackgroundUniform {
+                data: BackgroundMode::Transparent.as_uniform(),
+            }]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         let display_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("paint canvas display bind group layout"),
             entries: &[
@@ -165,6 +201,16 @@ impl PaintCanvas {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -175,6 +221,7 @@ impl PaintCanvas {
                 wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&texture_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: background_buffer.as_entire_binding() },
             ],
         });
 
@@ -212,12 +259,12 @@ impl PaintCanvas {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
-                    // ALPHA_BLENDING, not REPLACE — see struct doc
-                    // comment. Without this, a transparent canvas would
-                    // render as solid black in-app wherever nothing's
-                    // been painted, instead of showing the scene
-                    // background through it.
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    // REPLACE, not ALPHA_BLENDING — the shader now does
+                    // its own full compositing (canvas over checkerboard
+                    // or canvas over solid color) and always outputs
+                    // alpha 1.0, so there's nothing left for the GPU
+                    // blend unit to do.
+                    blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -312,6 +359,7 @@ impl PaintCanvas {
             display_index_buffer,
             display_bind_group,
             camera_buffer,
+            background_buffer,
             stamp_pipeline,
         }
     }
@@ -324,6 +372,17 @@ impl PaintCanvas {
         );
     }
 
+    /// Changes what the display pipeline composites the (always
+    /// true-alpha) canvas texture against. Doesn't touch the canvas's
+    /// own pixel data at all.
+    pub fn set_background_mode(&self, queue: &wgpu::Queue, mode: BackgroundMode) {
+        queue.write_buffer(
+            &self.background_buffer,
+            0,
+            bytemuck::cast_slice(&[BackgroundUniform { data: mode.as_uniform() }]),
+        );
+    }
+
     /// Half-extent of the canvas plane in world units — exposed so the
     /// caller can convert a touch position into canvas UV.
     pub fn half_size(&self) -> f32 {
@@ -332,9 +391,7 @@ impl PaintCanvas {
 
     /// Texture resolution in pixels (square) — exposed so callers can
     /// convert UV-space distances into canvas-pixel distances. Needed by
-    /// mxross-brush's spacing calculation, which works in real pixels
-    /// (matching Krita/Photoshop's definition of "spacing") rather than
-    /// abstract 0..1 UV fractions.
+    /// mxross-brush's spacing calculation, which works in real pixels.
     pub fn texture_size_px(&self) -> f32 {
         TEXTURE_SIZE as f32
     }
@@ -412,10 +469,9 @@ impl PaintCanvas {
     }
 
     /// Reads the canvas texture back to CPU memory as tightly-packed
-    /// RGBA8 (no row padding in the result, even though the GPU copy
-    /// itself requires 256-byte-aligned rows — that padding is stripped
-    /// here so callers never need to know it exists). Returns
-    /// `(width, height, pixels)`.
+    /// RGBA8 (true alpha, regardless of the current `BackgroundMode` —
+    /// that's purely a display-time setting; this always returns the
+    /// real data). Returns `(width, height, pixels)`.
     ///
     /// Blocks the calling thread until the copy completes — this is a
     /// rare, user-triggered action (export), not something called every
@@ -458,8 +514,6 @@ impl PaintCanvas {
             let _ = tx.send(result);
         });
 
-        // Blocks until the copy (and the map_async callback above) have
-        // both completed.
         device
             .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
             .expect("device poll failed during canvas readback");
@@ -479,4 +533,4 @@ impl PaintCanvas {
 
         (TEXTURE_SIZE, TEXTURE_SIZE, pixels)
     }
-}
+            }
