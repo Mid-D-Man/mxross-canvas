@@ -5,6 +5,7 @@ mod gizmo;
 mod gpu;
 mod ui;
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use android_activity::input::{InputEvent, MotionAction};
@@ -34,28 +35,19 @@ fn install_panic_hook(app: &AndroidApp) {
 }
 
 /// Writes an exported PNG to `external_data_path()/exports/canvas.png`
-/// (falling back to internal storage), the same location pattern
-/// `crash.txt` uses — readable with a normal file manager at
-/// `Android/data/com.midmanstudio.mxross/files/exports/canvas.png`.
-/// Overwrites the same filename every time for now; multiple distinct
-/// exports (timestamped names, or a proper save dialog) is a follow-up,
-/// not needed for "does export actually work end to end."
-fn save_export(app: &AndroidApp, bytes: &[u8]) {
-    let Some(dir) = app.external_data_path().or_else(|| app.internal_data_path()) else {
-        log::error!("no writable storage path available for export");
-        return;
-    };
+/// (falling back to internal storage). Returns the path on success so
+/// the caller can show it — that confirmation is the whole point now.
+fn save_export(app: &AndroidApp, bytes: &[u8]) -> Result<PathBuf, String> {
+    let dir = app
+        .external_data_path()
+        .or_else(|| app.internal_data_path())
+        .ok_or_else(|| "no writable storage path available".to_string())?;
     let path = dir.join("exports").join("canvas.png");
     if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            log::error!("failed to create export directory: {e}");
-            return;
-        }
+        std::fs::create_dir_all(parent).map_err(|e| format!("couldn't create export dir: {e}"))?;
     }
-    match std::fs::write(&path, bytes) {
-        Ok(()) => log::info!("Exported canvas to {}", path.display()),
-        Err(e) => log::error!("failed to write exported PNG: {e}"),
-    }
+    std::fs::write(&path, bytes).map_err(|e| format!("couldn't write file: {e}"))?;
+    Ok(path)
 }
 
 #[no_mangle]
@@ -131,8 +123,18 @@ fn android_main(app: AndroidApp) {
         if let Some(state) = gpu.as_mut() {
             state.render(BACKGROUND, pixels_per_point);
             if let Some(bytes) = state.take_pending_export() {
-                save_export(&app, &bytes);
+                let status = match save_export(&app, &bytes) {
+                    Ok(path) => {
+                        log::info!("Exported canvas to {}", path.display());
+                        format!("Exported: {}", path.display())
+                    }
+                    Err(e) => {
+                        log::error!("failed to write exported PNG: {e}");
+                        format!("Export failed: {e}")
+                    }
+                };
+                state.set_export_status(status);
             }
         }
     }
-    }
+}
