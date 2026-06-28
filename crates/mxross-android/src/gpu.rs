@@ -5,10 +5,9 @@
 //! routing (orbit/zoom/paint) handled by mxross-interaction's
 //! `CanvasController`, and the egui UI (ui.rs) drawn flat on top.
 //!
-//! This is the one file in the whole app allowed to know about both
-//! `mxross-brush` (for the `DabPlan` type) and `mxross-render-gpu` (for
-//! `Dab`) — that's deliberate, not an oversight. Converting one into the
-//! other happens exactly once, in `apply_dabs` below.
+//! This is the one file allowed to know about `mxross-brush` (for
+//! `DabPlan`), `mxross-render-gpu` (for `Dab`/`BackgroundMode`), and
+//! `mxross-export` (for PNG encoding) all at once — that's deliberate.
 //!
 //! ## The HasDisplayHandle gap
 //!
@@ -36,7 +35,7 @@ use raw_window_handle::{
 
 use mxross_brush::DabPlan;
 use mxross_interaction::CanvasController;
-use mxross_render_gpu::{Dab, PaintCanvas};
+use mxross_render_gpu::{BackgroundMode, Dab, PaintCanvas};
 
 use crate::ui::AppUi;
 
@@ -63,10 +62,11 @@ impl HasDisplayHandle for WindowHandles {
 
 /// Everything needed to render a frame. Rebuilt from scratch on every
 /// Android `InitWindow` event and torn down on `TerminateWindow` (see
-/// lib.rs) — which means camera mode, the paint canvas, and egui's
-/// internal state all reset on a window swap. Acceptable for now;
-/// revisit (the canvas especially — losing a painting on backgrounding
-/// would actually be bad) once there's a real save/load path.
+/// lib.rs) — which means camera mode, the paint canvas, background mode,
+/// and egui's internal state all reset on a window swap. Acceptable for
+/// now; revisit (the canvas especially — losing a painting on
+/// backgrounding would actually be bad) once there's a real save/load
+/// path.
 pub struct GpuState {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -75,16 +75,18 @@ pub struct GpuState {
     depth_view: wgpu::TextureView,
     canvas: PaintCanvas,
     controller: CanvasController,
+    background_mode: BackgroundMode,
     ui: AppUi,
     egui_renderer: egui_wgpu::Renderer,
     pending_ui_events: Vec<egui::Event>,
+    /// Filled in by `render` when the export button was clicked, taken
+    /// (and written to disk) by lib.rs's main loop right after —
+    /// GpuState has no filesystem-path knowledge of its own (that's
+    /// `AndroidApp::external_data_path`, which lives in lib.rs).
+    pending_export: Option<Vec<u8>>,
 }
 
 impl GpuState {
-    /// Builds the full Instance -> Surface -> Adapter -> Device chain for
-    /// `window`, configures the surface, and creates the depth buffer,
-    /// paint canvas, interaction controller, and egui renderer at its
-    /// current size.
     pub fn new(window: NativeWindow) -> Result<Self, String> {
         pollster::block_on(Self::new_async(window))
     }
@@ -93,9 +95,6 @@ impl GpuState {
         let width = window.width().max(1) as u32;
         let height = window.height().max(1) as u32;
 
-        // VULKAN explicitly, not Backends::all() — GLES is the
-        // emulator/x86 fallback tier here, not something to design around;
-        // the target device (Samsung A13) supports Vulkan directly.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             flags: Default::default(),
@@ -159,9 +158,11 @@ impl GpuState {
             depth_view,
             canvas,
             controller,
+            background_mode: BackgroundMode::Transparent,
             ui: AppUi::new(),
             egui_renderer,
             pending_ui_events: Vec::new(),
+            pending_export: None,
         })
     }
 
@@ -179,9 +180,6 @@ impl GpuState {
         texture.create_view(&wgpu::TextureViewDescriptor::default())
     }
 
-    /// Re-applies the config, rebuilds the depth buffer, and tells the
-    /// controller about the new size. Wired up to Android's
-    /// `WindowResized` event (see lib.rs).
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -193,8 +191,6 @@ impl GpuState {
         self.controller.resize(width as f32, height as f32);
     }
 
-    /// Converts mxross-brush's `DabPlan`s into mxross-render-gpu's
-    /// `Dab`s and draws them — the one place both types are named.
     fn apply_dabs(&self, plans: Vec<DabPlan>) {
         if plans.is_empty() {
             return;
@@ -206,10 +202,6 @@ impl GpuState {
         self.canvas.stamp_many(&self.device, &self.queue, &dabs);
     }
 
-    /// `x`/`y` are raw window pixel coordinates — converted to egui
-    /// "points" internally using `pixels_per_point`. Only for a genuine
-    /// first finger (Android `MotionAction::Down`) — a second finger
-    /// landing (`PointerDown`) goes through `second_touch_down` instead.
     pub fn touch_down(&mut self, x: f32, y: f32, pixels_per_point: f32) {
         self.pending_ui_events.push(egui::Event::PointerButton {
             pos: egui::pos2(x / pixels_per_point, y / pixels_per_point),
@@ -221,14 +213,10 @@ impl GpuState {
         self.apply_dabs(plans);
     }
 
-    /// A second finger touched down — treated as the start of a pinch,
-    /// not painting.
     pub fn second_touch_down(&mut self) {
         self.controller.second_pointer_down();
     }
 
-    /// `pointers` are ALL currently active touches, in window pixel
-    /// coordinates.
     pub fn touch_move(&mut self, pointers: &[(f32, f32)], pixels_per_point: f32) {
         if let Some(&(x, y)) = pointers.first() {
             self.pending_ui_events.push(egui::Event::PointerMoved(egui::pos2(
@@ -252,8 +240,30 @@ impl GpuState {
         self.apply_dabs(plans);
     }
 
-    /// Clears to `clear_color`, depth-tests the canvas plane, then draws
-    /// the egui UI flat on top.
+    /// Reads the canvas back and encodes it as PNG bytes, honoring the
+    /// current background mode: transparent stays transparent, solid
+    /// gets flattened onto that color first — matches whatever the live
+    /// preview is currently showing, not silently always one or the
+    /// other.
+    fn export_png(&self) -> Result<Vec<u8>, String> {
+        let (width, height, rgba) = self.canvas.read_pixels(&self.device, &self.queue);
+        let pixels = match self.background_mode {
+            BackgroundMode::Transparent => rgba,
+            BackgroundMode::Solid([r, g, b]) => {
+                let bg = [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8];
+                mxross_export::flatten_onto(&rgba, bg)
+            }
+        };
+        mxross_export::encode_png(width, height, &pixels)
+    }
+
+    /// Takes whatever PNG bytes `render` produced this frame, if any.
+    /// Called by lib.rs right after `render`, which is the only place
+    /// that knows how to turn this into an actual file on disk.
+    pub fn take_pending_export(&mut self) -> Option<Vec<u8>> {
+        self.pending_export.take()
+    }
+
     pub fn render(&mut self, clear_color: wgpu::Color, pixels_per_point: f32) {
         let aspect = self.config.width as f32 / self.config.height as f32;
         self.canvas.set_camera(&self.queue, self.controller.camera().view_proj(aspect));
@@ -261,10 +271,27 @@ impl GpuState {
         let events = std::mem::take(&mut self.pending_ui_events);
         let output = self.ui.run_frame(
             self.controller.camera_mut(),
+            self.background_mode,
             events,
             (self.config.width, self.config.height),
             pixels_per_point,
         );
+
+        if self.ui.take_background_toggle_requested() {
+            self.background_mode = match self.background_mode {
+                BackgroundMode::Transparent => BackgroundMode::white(),
+                BackgroundMode::Solid(_) => BackgroundMode::Transparent,
+            };
+            self.canvas.set_background_mode(&self.queue, self.background_mode);
+        }
+
+        if self.ui.take_export_request() {
+            match self.export_png() {
+                Ok(bytes) => self.pending_export = Some(bytes),
+                Err(e) => log::error!("PNG export failed: {e}"),
+            }
+        }
+
         let paint_jobs = self.ui.ctx().tessellate(output.shapes, output.pixels_per_point);
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
@@ -341,4 +368,4 @@ impl GpuState {
             self.egui_renderer.free_texture(id);
         }
     }
-            }
+        }
