@@ -28,7 +28,7 @@ mxross-brush = { path = "../mxross-brush" }
 mxross-interaction = { path = "../mxross-interaction" }
 # GPU rendering: the paint canvas texture + pipelines.
 mxross-render-gpu = { path = "../mxross-render-gpu" }
-
+mxross-android-media = { path = "../mxross-android-media" }
 # Needed explicitly so we can name HardwareBufferFormat/NativeWindow in our
 # own code — android-activity depends on the same ndk 0.9, so this resolves
 # to one shared copy in the dependency graph, not a duplicate.
