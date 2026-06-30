@@ -9,6 +9,7 @@ members = [
     "crates/mxross-camera",
     "crates/mxross-interaction",
     "crates/mxross-export",
+    "crates/mxross-android-media",
     "crates/mxross-document",
     "crates/mxross-brush",
     "crates/mxross-ffi",
