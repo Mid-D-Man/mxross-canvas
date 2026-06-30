@@ -5,7 +5,6 @@ mod gizmo;
 mod gpu;
 mod ui;
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use android_activity::input::{InputEvent, MotionAction};
@@ -20,6 +19,9 @@ const BACKGROUND: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
+/// Crash log stays in the app-private sandbox on purpose — unlike an
+/// export, a crash log isn't something you want cluttering the Gallery,
+/// and it's not something that needs MediaStore visibility at all.
 fn install_panic_hook(app: &AndroidApp) {
     let crash_path = app
         .external_data_path()
@@ -34,20 +36,22 @@ fn install_panic_hook(app: &AndroidApp) {
     }
 }
 
-/// Writes an exported PNG to `external_data_path()/exports/canvas.png`
-/// (falling back to internal storage). Returns the path on success so
-/// the caller can show it — that confirmation is the whole point now.
-fn save_export(app: &AndroidApp, bytes: &[u8]) -> Result<PathBuf, String> {
-    let dir = app
-        .external_data_path()
-        .or_else(|| app.internal_data_path())
-        .ok_or_else(|| "no writable storage path available".to_string())?;
-    let path = dir.join("exports").join("canvas.png");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("couldn't create export dir: {e}"))?;
+/// Writes the exported PNG into the Gallery-visible
+/// `Pictures/MxRoss/canvas.png` via MediaStore (see
+/// mxross-android-media) — NOT the hidden `Android/data/...` sandbox
+/// `crash.txt` uses. Returns a short human-readable result string either
+/// way, for `AppUi`'s on-screen status line.
+fn save_export(bytes: &[u8]) -> String {
+    match mxross_android_media::save_png_to_pictures("canvas.png", "MxRoss", bytes) {
+        Ok(()) => {
+            log::info!("Exported canvas to Pictures/MxRoss/canvas.png");
+            "Exported to Pictures/MxRoss/canvas.png".to_string()
+        }
+        Err(e) => {
+            log::error!("failed to write exported PNG: {e}");
+            format!("Export failed: {e}")
+        }
     }
-    std::fs::write(&path, bytes).map_err(|e| format!("couldn't write file: {e}"))?;
-    Ok(path)
 }
 
 #[no_mangle]
@@ -123,18 +127,9 @@ fn android_main(app: AndroidApp) {
         if let Some(state) = gpu.as_mut() {
             state.render(BACKGROUND, pixels_per_point);
             if let Some(bytes) = state.take_pending_export() {
-                let status = match save_export(&app, &bytes) {
-                    Ok(path) => {
-                        log::info!("Exported canvas to {}", path.display());
-                        format!("Exported: {}", path.display())
-                    }
-                    Err(e) => {
-                        log::error!("failed to write exported PNG: {e}");
-                        format!("Export failed: {e}")
-                    }
-                };
+                let status = save_export(&bytes);
                 state.set_export_status(status);
             }
         }
     }
-}
+    }
