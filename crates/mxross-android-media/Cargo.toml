@@ -1,0 +1,20 @@
+[package]
+name        = "mxross-android-media"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["MidManStudio"]
+description = "MxRoss Canvas Android MediaStore bridge — writes exported images to a real, Gallery-visible location (Pictures/MxRoss) via JNI. Android-only, isolated here so the rest of the export pipeline (mxross-export) stays platform-agnostic."
+license     = "MIT"
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Default features only — no Android-specific feature is required (verified
+# against the actual dependency graph). The two optional deps that DO exist
+# (java-locator, libloading) are both gated cfg(not(target_os = "android"))
+# already, so they're compiled out on our targets regardless.
+jni = "0.22"
+# android-activity already registers the running app's JavaVM + Activity
+# pointers with this crate internally (confirmed in its own source doc
+# comments) — this is the documented, crate-agnostic retrieval point,
+# rather than depending on android-activity's own (less discoverable)
+# vm/context pointer accessors directly.
+ndk-context = "0.1"
