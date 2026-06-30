@@ -1,17 +1,15 @@
 // crates/mxross-camera/src/orbit.rs
 //! Touch-driven camera — two modes, matching the decided MxRoss Canvas
 //! viewport architecture:
-//!   - `LockedOrtho` (default): flat orthographic view, no drag input,
-//!     pinch-to-zoom and axis-gizmo snapping. Painting only happens here
-//!     in the front-facing orientation specifically — see `is_front_view`
-//!     (that gating logic itself lives in the interaction layer, not
-//!     here; this crate only describes what the camera *is*, not how
-//!     input gets routed to painting).
+//!   - `LockedOrtho` (default): flat orthographic view, no orbit drag,
+//!     pinch-to-zoom, two-finger pan, and axis-gizmo snapping.
 //!   - `FreeOrbit`: perspective orbit, single-finger drag + pinch-zoom +
-//!     axis-gizmo snapping.
-//! Both modes share one yaw/pitch/radius state — "locked" only means
-//! "no free dragging", not "frozen direction"; snapping to a cardinal
-//! axis re-points either mode at it, exactly like Blender's numpad views.
+//!     axis-gizmo snapping. No panning in this mode yet — see `pan`'s
+//!     doc comment for why that's scoped out rather than half-built.
+//! Both modes share one yaw/pitch/radius/pan_offset state — "locked"
+//! only means "no free dragging", not "frozen direction or position";
+//! snapping to a cardinal axis re-points either mode at it, exactly like
+//! Blender's numpad views.
 
 use mxross_math::{Mat4, Vec3};
 
@@ -31,14 +29,17 @@ const ORBIT_SENSITIVITY: f32 = 0.005;
 const MAX_DRAG_PITCH: f32 = 85.0 / 180.0 * std::f32::consts::PI;
 
 /// Pinch-zoom clamp on `radius`. Also bounds the LockedOrtho half-height,
-/// since both modes share this one knob.
-const MIN_RADIUS: f32 = 1.0;
-const MAX_RADIUS: f32 = 20.0;
+/// since both modes share this one knob. Widened from the original
+/// (1.0, 20.0) — these are still just a reasonable starting point for
+/// "more zoom range in both directions", not a measured-correct value;
+/// easy to retune further if it still feels off on-device.
+const MIN_RADIUS: f32 = 0.5;
+const MAX_RADIUS: f32 = 30.0;
 
 /// `LockedOrtho`'s half-height as a fraction of `radius` — chosen so the
 /// default radius (4.0) gives a half-height of 2.5, slightly larger than
 /// the paint canvas's own half-size (2.0) so the canvas doesn't fill the
-/// entire screen at default zoom (leaves room for UI in the corners).
+/// entire screen at default zoom.
 const ORTHO_HALF_HEIGHT_FACTOR: f32 = 0.625;
 
 /// A cardinal world axis, as offered by the gizmo (mxross-android's
@@ -90,6 +91,10 @@ pub struct OrbitCamera {
     pitch: f32,
     radius: f32,
     mode: CameraMode,
+    /// What the camera looks at — replaces a hardcoded `Vec3::ZERO`
+    /// target. Shifted by `pan()`. The eye is always `radius` away from
+    /// this point, in the `direction()` computed from yaw/pitch.
+    pan_offset: Vec3,
 }
 
 impl OrbitCamera {
@@ -101,6 +106,7 @@ impl OrbitCamera {
             pitch: 0.0,
             radius: 4.0,
             mode: CameraMode::LockedOrtho,
+            pan_offset: Vec3::ZERO,
         }
     }
 
@@ -135,6 +141,51 @@ impl OrbitCamera {
         self.radius = (self.radius / factor).clamp(MIN_RADIUS, MAX_RADIUS);
     }
 
+    /// Two-finger drag pan, in raw screen pixels (`screen_dx`/`screen_dy`
+    /// = midpoint delta since the last sample). LockedOrtho only — true
+    /// panning in FreeOrbit needs a defined depth plane to be pixel-
+    /// accurate (1:1 finger tracking depends on how far away the thing
+    /// you're "grabbing" actually is), and there's no real 3D scene
+    /// content yet to anchor that against. `focus_canvas` is the
+    /// FreeOrbit-safe escape hatch for "I've lost the canvas" instead.
+    ///
+    /// Sign derivation: shifting `pan_offset` moves both eye and target
+    /// together, which is equivalent to sliding the whole camera rig in
+    /// world space — a fixed world point then appears to move by the
+    /// OPPOSITE of that shift, decomposed onto the camera's own right/up
+    /// axes. Worked through by hand (not something I can verify by
+    /// reading source the way an API signature can be) to make content
+    /// follow the finger 1:1; if it ends up feeling backwards on device,
+    /// it's a one-line sign flip on either term below, same as the
+    /// orbit-drag sensitivity comment above.
+    pub fn pan(&mut self, screen_dx: f32, screen_dy: f32, screen_width_px: f32, screen_height_px: f32) {
+        if self.mode != CameraMode::LockedOrtho {
+            return;
+        }
+        if screen_width_px <= 0.0 || screen_height_px <= 0.0 {
+            return;
+        }
+        let aspect = screen_width_px / screen_height_px;
+        let (half_width, half_height) = self.ortho_half_extents(aspect);
+        let world_per_px_x = (half_width * 2.0) / screen_width_px;
+        let world_per_px_y = (half_height * 2.0) / screen_height_px;
+
+        let (right, up, _forward) = self.basis();
+        self.pan_offset -= right * (screen_dx * world_per_px_x);
+        self.pan_offset += up * (screen_dy * world_per_px_y);
+    }
+
+    /// Resets the look-at target back to the origin — the "I've lost
+    /// the canvas, bring it back" recovery button. Deliberately leaves
+    /// zoom and rotation untouched: it should put the canvas back in
+    /// view without also fighting whatever angle/zoom you were
+    /// otherwise deliberately at. Safe to call in either mode, even
+    /// though only LockedOrtho can currently create a nonzero
+    /// `pan_offset` in the first place.
+    pub fn focus_canvas(&mut self) {
+        self.pan_offset = Vec3::ZERO;
+    }
+
     /// Snaps to look directly down a cardinal axis — works in either
     /// mode, and deliberately bypasses `MAX_DRAG_PITCH`: a snap lands
     /// exactly on ±90° for true top/bottom views, which is safe here
@@ -146,8 +197,6 @@ impl OrbitCamera {
     }
 
     /// True when looking straight down -Z at the default front angle.
-    /// Orbit-camera-specific concept — see module/crate doc comments on
-    /// why this isn't part of the shared `Camera` trait.
     pub fn is_front_view(&self) -> bool {
         self.yaw.abs() < 0.001 && self.pitch.abs() < 0.001
     }
@@ -182,7 +231,7 @@ impl OrbitCamera {
     }
 
     fn eye(&self) -> Vec3 {
-        self.direction() * self.radius
+        self.direction() * self.radius + self.pan_offset
     }
 
     /// World "up" reference fed to `look_at_rh`. `Vec3::Y` everywhere
@@ -203,7 +252,8 @@ impl OrbitCamera {
 
     /// `(right, up, forward)` camera-space basis for the current view —
     /// `forward` points from the eye toward the look-at target. Used by
-    /// the gizmo to project world axes into screen space. Same
+    /// the gizmo to project world axes into screen space, and by `pan`
+    /// to convert screen-pixel drag into a world-space offset. Same
     /// cross-product order `Mat4::look_at_rh` uses internally, so this
     /// basis matches what's actually on screen.
     pub fn basis(&self) -> (Vec3, Vec3, Vec3) {
@@ -215,7 +265,7 @@ impl OrbitCamera {
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
-        let view = Mat4::look_at_rh(self.eye(), Vec3::ZERO, self.up_vector());
+        let view = Mat4::look_at_rh(self.eye(), self.pan_offset, self.up_vector());
         match self.mode {
             CameraMode::LockedOrtho => {
                 let (half_width, half_height) = self.ortho_half_extents(aspect);
@@ -240,9 +290,6 @@ impl Default for OrbitCamera {
 
 impl Camera for OrbitCamera {
     fn view_proj(&self, aspect: f32) -> Mat4 {
-        // Resolves to the inherent method above, not infinite recursion
-        // — Rust always prefers an inherent method over a trait method
-        // of the same name when called on a concrete type.
         self.view_proj(aspect)
     }
-          }
+        }
