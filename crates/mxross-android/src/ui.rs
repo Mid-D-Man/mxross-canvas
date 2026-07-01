@@ -129,7 +129,13 @@ impl AppUi {
                         clicked_export = true;
                     }
                 });
-
+egui::Area::new(egui::Id::new("focus_canvas"))
+                .fixed_pos(egui::pos2(16.0, 216.0))
+                .show(ui.ctx(), |ui| {
+                    if ui.button("Focus Canvas").clicked() {
+                        clicked_focus = true;
+                    }
+                });
             if let Some(status) = &export_status {
                 egui::Area::new(egui::Id::new("export_status"))
                     .fixed_pos(egui::pos2(16.0, 176.0))
