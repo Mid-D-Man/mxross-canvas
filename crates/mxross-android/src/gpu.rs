@@ -250,6 +250,12 @@ impl GpuState {
     }
 
     pub fn render(&mut self, clear_color: wgpu::Color, pixels_per_point: f32) {
+        // Commits any touch-start that's cleared the pinch-disambiguation
+        // window since the last frame — see CanvasController::tick's doc
+        // comment. Done before anything else so a freshly-committed dab
+        // still shows up in THIS frame's draw, not the next one.
+        let tick_dabs = self.controller.tick();
+        self.apply_dabs(tick_dabs);
         let aspect = self.config.width as f32 / self.config.height as f32;
         self.canvas.set_camera(&self.queue, self.controller.camera().view_proj(aspect));
 
