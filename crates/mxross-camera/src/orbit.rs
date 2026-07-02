@@ -175,15 +175,16 @@ impl OrbitCamera {
         self.pan_offset += up * (screen_dy * world_per_px_y);
     }
 
-    /// Resets the look-at target back to the origin — the "I've lost
-    /// the canvas, bring it back" recovery button. Deliberately leaves
-    /// zoom and rotation untouched: it should put the canvas back in
-    /// view without also fighting whatever angle/zoom you were
-    /// otherwise deliberately at. Safe to call in either mode, even
-    /// though only LockedOrtho can currently create a nonzero
-    /// `pan_offset` in the first place.
+    /// Resets the camera to look directly at the canvas front-on —
+    /// clears pan, snaps yaw/pitch back to zero, and forces LockedOrtho.
+    /// "Focus on the canvas regardless of where the axis is" means
+    /// actually facing it again, not just recentering while still looking
+    /// sideways at it.
     pub fn focus_canvas(&mut self) {
         self.pan_offset = Vec3::ZERO;
+        self.yaw = 0.0;
+        self.pitch = 0.0;
+        self.mode = CameraMode::LockedOrtho;
     }
 
     /// Snaps to look directly down a cardinal axis — works in either
@@ -209,7 +210,14 @@ impl OrbitCamera {
         let half_height = self.radius * ORTHO_HALF_HEIGHT_FACTOR;
         (half_height * aspect, half_height)
     }
-
+/// Returns the pan offset's X and Y world-space components — the 2D
+    /// shift of the look-at target used to correct touch→canvas UV
+    /// mapping when the canvas has been panned away from the origin.
+    /// Only X/Y matter for the front-view mapping; Z is the depth axis
+    /// and the canvas always sits at Z=0.
+    pub fn pan_offset_xy(&self) -> (f32, f32) {
+        (self.pan_offset.x, self.pan_offset.y)
+        }
     /// Short human-readable camera state, for an on-screen readout.
     pub fn readout(&self) -> String {
         match self.mode {
