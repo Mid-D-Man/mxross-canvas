@@ -1,33 +1,31 @@
 // crates/mxross-android-media/src/lib.rs
-//! Writes bytes into Android's MediaStore (the Pictures/Movies/etc.
-//! gallery index), so exported files actually show up in the Gallery
-//! app and any normal file manager — unlike
-//! `external_data_path()/exports/...`, which is real storage but lives
-//! in the app-private, hidden `Android/data/<package>/` sandbox.
+//! Writes bytes into Android's MediaStore so exported files show up in
+//! the Gallery app and any normal file manager.
 //!
-//! ## API notes (verified against jni 0.22.4 source directly)
+//! ## Verified API constraints (jni 0.22.4 source)
 //!
-//! - `JavaVM::from_raw` returns `Self` directly, NOT `Result` — no
-//!   `.map_err()` needed; `assert!(!ptr.is_null())` is its only check.
-//! - Method names require `jni_str!("name")` which gives `&JNIStr`,
-//!   since `CStr` does NOT implement `AsRef<JNIStr>` despite the
-//!   `c"..."` literal syntax looking similar.
-//! - `RuntimeMethodSignature` does NOT implement `AsRef<MethodSignature>`
-//!   directly — you must call `.method_signature()` on it first, which
-//!   does implement that trait.
-//! - `JObject::from_raw` takes `(&env, raw)` not just `(raw)`.
-//! - `get_static_field` takes `S: AsRef<FieldSignature>` — use
-//!   `RuntimeFieldSignature::from_str(...)?` then `.field_signature()`.
+//! - `JavaVM::from_raw` returns `Self` (not `Result`) — no `.map_err()`.
+//! - `attach_current_thread` requires `E: From<jni::errors::Error>` —
+//!   `String` does NOT satisfy this. A local `MediaError` type below
+//!   bridges both JNI errors (via `From<jni::errors::Error>`) and our
+//!   own descriptive messages, then converts to `String` after the
+//!   closure returns.
+//! - Every `AsRef<JNIStr>` param (find_class, call_method name, etc.)
+//!   needs `jni_str!("...")` — plain `&str` / `&CStr` do NOT satisfy
+//!   that trait.
+//! - `RuntimeMethodSignature` needs `.method_signature()` before being
+//!   passed to `call_method` / `call_static_method` / `new_object`.
+//! - `RuntimeFieldSignature` needs `.field_signature()` before being
+//!   passed to `get_static_field`.
+//! - `JObject::from_raw` takes `(&mut env, raw)` not just `(raw)`.
+//! - Inner closures that capture `env` mutably conflict with the outer
+//!   `attach_current_thread` closure — everything is inlined flat.
 //!
-//! ## Scope limitation, stated plainly
+//! ## Scope limitation
 //!
-//! `MediaStore.Images.Media.RELATIVE_PATH` only exists on API 29+
-//! (Android 10, "Scoped Storage"). The app currently allows
-//! `min_sdk_version = 26`, so devices on API 26–28 will get a JNI
-//! error from this function rather than a working export. The real test
-//! hardware (Samsung A13) is API 33, so this isn't a blocking problem
-//! right now — raise `min_sdk_version` to 29 in
-//! `mxross-android/Cargo.toml` when/if that gap actually matters.
+//! `RELATIVE_PATH` only exists on API 29+. `min_sdk_version = 26` means
+//! API 26–28 devices will get an error string, not a working export.
+//! The real test hardware (Samsung A13) is API 33 so this isn't blocking.
 
 #[cfg(target_os = "android")]
 mod android_impl {
@@ -35,201 +33,238 @@ mod android_impl {
     use jni::signature::{RuntimeFieldSignature, RuntimeMethodSignature};
     use jni::{jni_str, JavaVM};
 
+    /// Local error type satisfying `E: From<jni::errors::Error>` as
+    /// required by `attach_current_thread`. Converts to `String` at the
+    /// public boundary.
+    enum MediaError {
+        Jni(jni::errors::Error),
+        Msg(String),
+    }
+
+    impl From<jni::errors::Error> for MediaError {
+        fn from(e: jni::errors::Error) -> Self {
+            MediaError::Jni(e)
+        }
+    }
+
+    impl MediaError {
+        fn into_string(self) -> String {
+            match self {
+                MediaError::Jni(e) => format!("JNI error: {e}"),
+                MediaError::Msg(s) => s,
+            }
+        }
+    }
+
+    macro_rules! msg {
+        ($($arg:tt)*) => {
+            MediaError::Msg(format!($($arg)*))
+        };
+    }
+
     pub fn save_png_to_pictures(
         display_name: &str,
         relative_subdir: &str,
         bytes: &[u8],
     ) -> Result<(), String> {
         let ctx = ndk_context::android_context();
-        // SAFETY: android-activity has already initialized this VM
-        // pointer before android_main runs.
+        // SAFETY: android-activity initializes the VM pointer before
+        // android_main ever runs — this is documented and safe to call
+        // from anywhere after that point.
         let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
-
         let activity_raw = ctx.context() as jni::sys::jobject;
 
-        vm.attach_current_thread(|env| -> Result<(), String> {
-            // --- Build ContentValues ---
+        vm.attach_current_thread(|env| -> Result<(), MediaError> {
+            // ── ContentValues values = new ContentValues() ────────────
             let cv_class = env
-                .find_class("android/content/ContentValues")
-                .map_err(|e| format!("find ContentValues: {e}"))?;
+                .find_class(jni_str!("android/content/ContentValues"))?;
             let new_sig = RuntimeMethodSignature::from_str("()V")
-                .map_err(|e| format!("sig: {e}"))?;
-            let values = env
-                .new_object(&cv_class, new_sig.method_signature(), &[])
-                .map_err(|e| format!("new ContentValues: {e}"))?;
+                .map_err(|e| msg!("bad sig ()V: {e}"))?;
+            let values = env.new_object(
+                &cv_class,
+                new_sig.method_signature(),
+                &[],
+            )?;
 
+            // ── Helper sigs ───────────────────────────────────────────
             let put_ss_sig = RuntimeMethodSignature::from_str(
                 "(Ljava/lang/String;Ljava/lang/String;)V",
             )
-            .map_err(|e| format!("sig: {e}"))?;
+            .map_err(|e| msg!("bad sig put_ss: {e}"))?;
             let put_ss = put_ss_sig.method_signature();
 
-            let put_str = |env: &mut jni::Env,
-                           key: &str,
-                           val: &str|
-             -> Result<(), String> {
-                let jk = env
-                    .new_string(key)
-                    .map_err(|e| format!("new_string({key}): {e}"))?;
-                let jv = env
-                    .new_string(val)
-                    .map_err(|e| format!("new_string({val}): {e}"))?;
-                env.call_method(
-                    &values,
-                    jni_str!("put"),
-                    put_ss,
-                    &[JValue::Object(&jk), JValue::Object(&jv)],
-                )
-                .map_err(|e| format!("put({key}): {e}"))?;
-                Ok(())
-            };
-
-            put_str(env, "_display_name", display_name)?;
-            put_str(env, "mime_type", "image/png")?;
-            put_str(env, "relative_path", &format!("Pictures/{relative_subdir}"))?;
-
-            // IS_PENDING = 1  (boxed Integer, not primitive int)
-            let integer_class = env
-                .find_class("java/lang/Integer")
-                .map_err(|e| format!("find Integer: {e}"))?;
-            let value_of_sig = RuntimeMethodSignature::from_str("(I)Ljava/lang/Integer;")
-                .map_err(|e| format!("sig: {e}"))?;
             let put_int_sig = RuntimeMethodSignature::from_str(
                 "(Ljava/lang/String;Ljava/lang/Integer;)V",
             )
-            .map_err(|e| format!("sig: {e}"))?;
+            .map_err(|e| msg!("bad sig put_int: {e}"))?;
+            let put_int = put_int_sig.method_signature();
 
-            let set_is_pending = |env: &mut jni::Env, flag: i32| -> Result<(), String> {
-                let boxed = env
-                    .call_static_method(
-                        &integer_class,
-                        jni_str!("valueOf"),
-                        value_of_sig.method_signature(),
-                        &[JValue::Int(flag)],
-                    )
-                    .map_err(|e| format!("Integer.valueOf({flag}): {e}"))?
-                    .l()
-                    .map_err(|e| format!("valueOf not object: {e}"))?;
-                let jk = env
-                    .new_string("is_pending")
-                    .map_err(|e| format!("new_string: {e}"))?;
-                env.call_method(
-                    &values,
-                    jni_str!("put"),
-                    put_int_sig.method_signature(),
-                    &[JValue::Object(&jk), JValue::Object(&boxed)],
-                )
-                .map_err(|e| format!("put(is_pending={flag}): {e}"))?;
-                Ok(())
-            };
-            set_is_pending(env, 1)?;
+            let void_sig = RuntimeMethodSignature::from_str("()V")
+                .map_err(|e| msg!("bad sig ()V: {e}"))?;
 
-            // --- resolver = activity.getContentResolver() ---
+            let value_of_sig =
+                RuntimeMethodSignature::from_str("(I)Ljava/lang/Integer;")
+                    .map_err(|e| msg!("bad sig valueOf: {e}"))?;
+
+            let integer_class =
+                env.find_class(jni_str!("java/lang/Integer"))?;
+
+            // ── values.put(key, str) ×3 ───────────────────────────────
+            let jdn = env.new_string(display_name)?;
+            let k_dn = env.new_string("_display_name")?;
+            env.call_method(
+                &values,
+                jni_str!("put"),
+                put_ss,
+                &[JValue::Object(&k_dn), JValue::Object(&jdn)],
+            )?;
+
+            let jmt = env.new_string("image/png")?;
+            let k_mt = env.new_string("mime_type")?;
+            env.call_method(
+                &values,
+                jni_str!("put"),
+                put_ss,
+                &[JValue::Object(&k_mt), JValue::Object(&jmt)],
+            )?;
+
+            let rel = format!("Pictures/{relative_subdir}");
+            let jrp = env.new_string(&rel)?;
+            let k_rp = env.new_string("relative_path")?;
+            env.call_method(
+                &values,
+                jni_str!("put"),
+                put_ss,
+                &[JValue::Object(&k_rp), JValue::Object(&jrp)],
+            )?;
+
+            // ── values.put("is_pending", Integer.valueOf(1)) ──────────
+            let boxed_one = env
+                .call_static_method(
+                    &integer_class,
+                    jni_str!("valueOf"),
+                    value_of_sig.method_signature(),
+                    &[JValue::Int(1)],
+                )?
+                .l()?;
+            let k_ip = env.new_string("is_pending")?;
+            env.call_method(
+                &values,
+                jni_str!("put"),
+                put_int,
+                &[JValue::Object(&k_ip), JValue::Object(&boxed_one)],
+            )?;
+
+            // ── resolver = activity.getContentResolver() ──────────────
             let activity_obj = unsafe { JObject::from_raw(env, activity_raw) };
             let get_resolver_sig = RuntimeMethodSignature::from_str(
                 "()Landroid/content/ContentResolver;",
             )
-            .map_err(|e| format!("sig: {e}"))?;
+            .map_err(|e| msg!("bad sig getContentResolver: {e}"))?;
             let resolver = env
                 .call_method(
                     &activity_obj,
                     jni_str!("getContentResolver"),
                     get_resolver_sig.method_signature(),
                     &[],
-                )
-                .map_err(|e| format!("getContentResolver: {e}"))?
-                .l()
-                .map_err(|e| format!("resolver not object: {e}"))?;
+                )?
+                .l()?;
 
-            // --- collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI ---
-            let media_class = env
-                .find_class("android/provider/MediaStore$Images$Media")
-                .map_err(|e| format!("find MediaStore.Images.Media: {e}"))?;
-            let uri_field_sig = RuntimeFieldSignature::from_str("Landroid/net/Uri;")
-                .map_err(|e| format!("field sig: {e}"))?;
+            // ── collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            let media_class = env.find_class(
+                jni_str!("android/provider/MediaStore$Images$Media"),
+            )?;
+            let uri_field_sig =
+                RuntimeFieldSignature::from_str("Landroid/net/Uri;")
+                    .map_err(|e| msg!("bad field sig: {e}"))?;
             let collection = env
                 .get_static_field(
                     &media_class,
                     jni_str!("EXTERNAL_CONTENT_URI"),
                     uri_field_sig.field_signature(),
-                )
-                .map_err(|e| format!("EXTERNAL_CONTENT_URI: {e}"))?
-                .l()
-                .map_err(|e| format!("uri not object: {e}"))?;
+                )?
+                .l()?;
 
-            // --- item = resolver.insert(collection, values) ---
+            // ── item = resolver.insert(collection, values) ────────────
             let insert_sig = RuntimeMethodSignature::from_str(
                 "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;",
             )
-            .map_err(|e| format!("sig: {e}"))?;
+            .map_err(|e| msg!("bad sig insert: {e}"))?;
             let item = env
                 .call_method(
                     &resolver,
                     jni_str!("insert"),
                     insert_sig.method_signature(),
-                    &[JValue::Object(&collection), JValue::Object(&values)],
-                )
-                .map_err(|e| format!("insert: {e}"))?
-                .l()
-                .map_err(|e| format!("item not object: {e}"))?;
+                    &[
+                        JValue::Object(&collection),
+                        JValue::Object(&values),
+                    ],
+                )?
+                .l()?;
             if item.is_null() {
-                return Err(
+                return Err(msg!(
                     "ContentResolver.insert returned null — MediaStore rejected the request"
-                        .to_string(),
-                );
+                ));
             }
 
-            // --- os = resolver.openOutputStream(item) ---
+            // ── os = resolver.openOutputStream(item) ──────────────────
             let open_sig = RuntimeMethodSignature::from_str(
                 "(Landroid/net/Uri;)Ljava/io/OutputStream;",
             )
-            .map_err(|e| format!("sig: {e}"))?;
+            .map_err(|e| msg!("bad sig openOutputStream: {e}"))?;
             let stream = env
                 .call_method(
                     &resolver,
                     jni_str!("openOutputStream"),
                     open_sig.method_signature(),
                     &[JValue::Object(&item)],
-                )
-                .map_err(|e| format!("openOutputStream: {e}"))?
-                .l()
-                .map_err(|e| format!("stream not object: {e}"))?;
+                )?
+                .l()?;
 
-            // --- os.write(bytes); os.close() ---
-            let jbytes = env
-                .byte_array_from_slice(bytes)
-                .map_err(|e| format!("byte_array_from_slice: {e}"))?;
+            // ── os.write(bytes); os.close() ───────────────────────────
+            let jbytes = env.byte_array_from_slice(bytes)?;
             let write_sig = RuntimeMethodSignature::from_str("([B)V")
-                .map_err(|e| format!("sig: {e}"))?;
+                .map_err(|e| msg!("bad sig write: {e}"))?;
             env.call_method(
                 &stream,
                 jni_str!("write"),
                 write_sig.method_signature(),
                 &[JValue::Object(&jbytes)],
-            )
-            .map_err(|e| format!("write: {e}"))?;
-
-            let close_sig = RuntimeMethodSignature::from_str("()V")
-                .map_err(|e| format!("sig: {e}"))?;
+            )?;
             env.call_method(
                 &stream,
                 jni_str!("close"),
-                close_sig.method_signature(),
+                void_sig.method_signature(),
                 &[],
-            )
-            .map_err(|e| format!("close: {e}"))?;
+            )?;
 
-            // --- resolver.update(item, values, null, null) to publish ---
-            let clear_sig = RuntimeMethodSignature::from_str("()V")
-                .map_err(|e| format!("sig: {e}"))?;
-            env.call_method(&values, jni_str!("clear"), clear_sig.method_signature(), &[])
-                .map_err(|e| format!("clear: {e}"))?;
-            set_is_pending(env, 0)?;
+            // ── resolver.update to clear IS_PENDING ───────────────────
+            env.call_method(
+                &values,
+                jni_str!("clear"),
+                void_sig.method_signature(),
+                &[],
+            )?;
+            let boxed_zero = env
+                .call_static_method(
+                    &integer_class,
+                    jni_str!("valueOf"),
+                    value_of_sig.method_signature(),
+                    &[JValue::Int(0)],
+                )?
+                .l()?;
+            let k_ip2 = env.new_string("is_pending")?;
+            env.call_method(
+                &values,
+                jni_str!("put"),
+                put_int,
+                &[JValue::Object(&k_ip2), JValue::Object(&boxed_zero)],
+            )?;
 
             let update_sig = RuntimeMethodSignature::from_str(
                 "(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I",
             )
-            .map_err(|e| format!("sig: {e}"))?;
+            .map_err(|e| msg!("bad sig update: {e}"))?;
             env.call_method(
                 &resolver,
                 jni_str!("update"),
@@ -240,20 +275,19 @@ mod android_impl {
                     JValue::Object(&JObject::null()),
                     JValue::Object(&JObject::null()),
                 ],
-            )
-            .map_err(|e| format!("update: {e}"))?;
+            )?;
 
             Ok(())
         })
-        .map_err(|e: String| e)
+        .map_err(|e: MediaError| e.into_string())
     }
 }
 
 #[cfg(target_os = "android")]
 pub use android_impl::save_png_to_pictures;
 
-/// Non-Android stub — always errors rather than failing to compile, so
-/// `mxross-android` doesn't need its own `cfg` gate at every call site.
+/// Non-Android stub so mxross-android doesn't need its own cfg gate
+/// at every call site.
 #[cfg(not(target_os = "android"))]
 pub fn save_png_to_pictures(
     _display_name: &str,
@@ -261,4 +295,4 @@ pub fn save_png_to_pictures(
     _bytes: &[u8],
 ) -> Result<(), String> {
     Err("mxross-android-media is only implemented for Android".to_string())
-                    }
+                }
