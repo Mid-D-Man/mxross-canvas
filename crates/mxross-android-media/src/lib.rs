@@ -91,13 +91,11 @@ mod android_impl {
                 "(Ljava/lang/String;Ljava/lang/String;)V",
             )
             .map_err(|e| msg!("bad sig put_ss: {e}"))?;
-            let put_ss = put_ss_sig.method_signature();
 
             let put_int_sig = RuntimeMethodSignature::from_str(
                 "(Ljava/lang/String;Ljava/lang/Integer;)V",
             )
             .map_err(|e| msg!("bad sig put_int: {e}"))?;
-            let put_int = put_int_sig.method_signature();
 
             let void_sig = RuntimeMethodSignature::from_str("()V")
                 .map_err(|e| msg!("bad sig ()V: {e}"))?;
@@ -115,7 +113,7 @@ mod android_impl {
             env.call_method(
                 &values,
                 jni_str!("put"),
-                put_ss,
+                put_ss_sig.method_signature(),
                 &[JValue::Object(&k_dn), JValue::Object(&jdn)],
             )?;
 
@@ -124,7 +122,7 @@ mod android_impl {
             env.call_method(
                 &values,
                 jni_str!("put"),
-                put_ss,
+                put_ss_sig.method_signature(),
                 &[JValue::Object(&k_mt), JValue::Object(&jmt)],
             )?;
 
@@ -134,7 +132,7 @@ mod android_impl {
             env.call_method(
                 &values,
                 jni_str!("put"),
-                put_ss,
+                put_ss_sig.method_signature(),
                 &[JValue::Object(&k_rp), JValue::Object(&jrp)],
             )?;
 
@@ -151,7 +149,7 @@ mod android_impl {
             env.call_method(
                 &values,
                 jni_str!("put"),
-                put_int,
+                put_int_sig.method_signature(),
                 &[JValue::Object(&k_ip), JValue::Object(&boxed_one)],
             )?;
 
@@ -257,7 +255,7 @@ mod android_impl {
             env.call_method(
                 &values,
                 jni_str!("put"),
-                put_int,
+                put_int_sig.method_signature(),
                 &[JValue::Object(&k_ip2), JValue::Object(&boxed_zero)],
             )?;
 
@@ -295,4 +293,4 @@ pub fn save_png_to_pictures(
     _bytes: &[u8],
 ) -> Result<(), String> {
     Err("mxross-android-media is only implemented for Android".to_string())
-                }
+}
