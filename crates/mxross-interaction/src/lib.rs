@@ -96,12 +96,17 @@ impl CanvasController {
     fn canvas_uv_at(&self, x: f32, y: f32) -> Option<(f32, f32)> {
         let aspect = self.screen_size.0 / self.screen_size.1;
         let (half_width, half_height) = self.camera.ortho_half_extents(aspect);
+        // pan_offset shifts the look-at target away from the origin —
+        // without adding it here, the UV mapping treats the camera as
+        // always looking at (0,0) in world space, so panning the canvas
+        // left then drawing puts ink somewhere off to the right.
+        let (pan_x, pan_y) = self.camera.pan_offset_xy();
 
         let ndc_x = (x / self.screen_size.0) * 2.0 - 1.0;
         let ndc_y = 1.0 - (y / self.screen_size.1) * 2.0;
 
-        let world_x = ndc_x * half_width;
-        let world_y = ndc_y * half_height;
+        let world_x = ndc_x * half_width + pan_x;
+        let world_y = ndc_y * half_height + pan_y;
 
         let u = (world_x / self.canvas_half_size + 1.0) / 2.0;
         let v = (1.0 - world_y / self.canvas_half_size) / 2.0;
