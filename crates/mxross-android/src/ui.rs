@@ -94,6 +94,7 @@ impl AppUi {
         let mut clicked_axis = None;
         let mut clicked_background = false;
         let mut clicked_export = false;
+        let mut clicked_focus = false;
 
         let output = self.ctx.run_ui(raw_input, |ui| {
             egui::Area::new(egui::Id::new("camera_mode_toggle"))
@@ -129,13 +130,15 @@ impl AppUi {
                         clicked_export = true;
                     }
                 });
-egui::Area::new(egui::Id::new("focus_canvas"))
+
+            egui::Area::new(egui::Id::new("focus_canvas"))
                 .fixed_pos(egui::pos2(16.0, 216.0))
                 .show(ui.ctx(), |ui| {
                     if ui.button("Focus Canvas").clicked() {
                         clicked_focus = true;
                     }
                 });
+
             if let Some(status) = &export_status {
                 egui::Area::new(egui::Id::new("export_status"))
                     .fixed_pos(egui::pos2(16.0, 176.0))
@@ -172,6 +175,9 @@ egui::Area::new(egui::Id::new("focus_canvas"))
         if clicked_export {
             self.export_requested = true;
         }
+        if clicked_focus {
+            camera.focus_canvas();
+        }
 
         self.pointer_over_ui = self.ctx.egui_wants_pointer_input();
 
@@ -183,4 +189,4 @@ impl Default for AppUi {
     fn default() -> Self {
         Self::new()
     }
-            }
+}
