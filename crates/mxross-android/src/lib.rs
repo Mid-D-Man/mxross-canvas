@@ -1,264 +1,135 @@
-// crates/mxross-interaction/src/lib.rs
-//! MxRoss Canvas interaction layer.
-//!
-//! Owns the camera + brush engine together and decides what a pointer
-//! event *means* — orbit/pan/zoom the camera, or paint a stroke — given
-//! only plain `f32` coordinates and a `bool` for "did the UI claim this
-//! pointer."
-//!
-//! ## Touch-start disambiguation
-//!
-//! A naive "first finger down = start painting immediately" has a real
-//! bug: in a genuine two-finger pinch gesture, the fingers never land at
-//! *exactly* the same instant — finger A's Down event always arrives
-//! some milliseconds before finger B's PointerDown. If finger A
-//! immediately commits a dab, that ink is already on the canvas before
-//! there's any way to know a second finger was coming at all; canceling
-//! the *stroke* once finger B arrives doesn't undo the dab that already
-//! landed. The fix: hold the first touch as `pending_start` rather than
-//! painting immediately, and only commit it once either (a) a short
-//! window passes with no second finger (`PAINT_START_DELAY`,
-//! confirmed via `tick`, called every frame), or (b) the finger lifts
-//! first (`pointer_up`) — lifting is itself proof no pinch is coming for
-//! this gesture, so that case commits immediately rather than waiting
-//! out the window pointlessly. If a second finger arrives at any point
-//! before either of those, `second_pointer_down` drops the pending start
-//! outright — no dab is ever created.
+// crates/mxross-android/src/lib.rs
+//! MxRoss Canvas — Android entry point.
 
-use std::time::{Duration, Instant};
+mod gizmo;
+mod gpu;
+mod ui;
 
-use mxross_brush::{BrushEngine, BrushPreset, DabPlan};
-use mxross_camera::{CameraMode, OrbitCamera};
+use std::time::Duration;
 
-/// How long a single-finger touch waits before committing its first dab,
-/// in case a second finger is about to land and turn this into a pinch
-/// instead. A feel constant, not something derivable from documentation
-/// — typical real-world pinch gestures land both fingers within a few
-/// tens of milliseconds of each other, so this gives comfortable margin
-/// without adding noticeable lag to an intentional single stroke. Worth
-/// tuning by feel on-device rather than treating as fixed.
-const PAINT_START_DELAY: Duration = Duration::from_millis(70);
+use android_activity::input::{InputEvent, MotionAction};
+use android_activity::{AndroidApp, InputStatus, MainEvent, PollEvent};
 
-struct PendingStart {
-    position: (f32, f32),
-    started_at: Instant,
+use gpu::GpuState;
+
+const BACKGROUND: wgpu::Color = wgpu::Color {
+    r: 30.0 / 255.0,
+    g: 30.0 / 255.0,
+    b: 40.0 / 255.0,
+    a: 1.0,
+};
+
+/// Crash log stays in the app-private sandbox on purpose — unlike an
+/// export, a crash log isn't something you want cluttering the Gallery,
+/// and it's not something that needs MediaStore visibility at all.
+fn install_panic_hook(app: &AndroidApp) {
+    let crash_path = app
+        .external_data_path()
+        .or_else(|| app.internal_data_path())
+        .map(|dir| dir.join("crash.txt"));
+
+    if let Some(path) = crash_path {
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = std::fs::write(&path, format!("{info}\n"));
+            log::error!("PANIC: {info}");
+        }));
+    }
 }
 
-pub struct CanvasController {
-    camera: OrbitCamera,
-    brush_engine: BrushEngine,
-    canvas_half_size: f32,
-    screen_size: (f32, f32),
-    last_pointer: Option<(f32, f32)>,
-    last_pinch_distance: Option<f32>,
-    last_pinch_midpoint: Option<(f32, f32)>,
-    is_painting: bool,
-    /// A first-finger touch that's eligible to paint but hasn't been
-    /// committed yet — see module doc comment.
-    pending_start: Option<PendingStart>,
+/// Writes the exported PNG into the Gallery-visible
+/// `Pictures/MxRoss/canvas.png` via MediaStore (see
+/// mxross-android-media) — NOT the hidden `Android/data/...` sandbox
+/// `crash.txt` uses. Returns a short human-readable result string either
+/// way, for `AppUi`'s on-screen status line.
+fn save_export(bytes: &[u8]) -> String {
+    match mxross_android_media::save_png_to_pictures("canvas.png", "MxRoss", bytes) {
+        Ok(()) => {
+            log::info!("Exported canvas to Pictures/MxRoss/canvas.png");
+            "Exported to Pictures/MxRoss/canvas.png".to_string()
+        }
+        Err(e) => {
+            log::error!("failed to write exported PNG: {e}");
+            format!("Export failed: {e}")
+        }
+    }
 }
 
-impl CanvasController {
-    pub fn new(canvas_half_size: f32, canvas_texture_size_px: f32, screen_size: (f32, f32)) -> Self {
-        Self {
-            camera: OrbitCamera::new(),
-            brush_engine: BrushEngine::new(BrushPreset::default_ink(), canvas_texture_size_px),
-            canvas_half_size,
-            screen_size,
-            last_pointer: None,
-            last_pinch_distance: None,
-            last_pinch_midpoint: None,
-            is_painting: false,
-            pending_start: None,
-        }
-    }
+#[no_mangle]
+fn android_main(app: AndroidApp) {
+    mxross_ffi::init_logger();
+    install_panic_hook(&app);
 
-    pub fn resize(&mut self, width: f32, height: f32) {
-        self.screen_size = (width, height);
-    }
+    let mut gpu: Option<GpuState> = None;
 
-    pub fn camera(&self) -> &OrbitCamera {
-        &self.camera
-    }
-
-    pub fn camera_mut(&mut self) -> &mut OrbitCamera {
-        &mut self.camera
-    }
-
-    pub fn brush_preset(&self) -> &BrushPreset {
-        self.brush_engine.preset()
-    }
-
-    pub fn brush_preset_mut(&mut self) -> &mut BrushPreset {
-        self.brush_engine.preset_mut()
-    }
-
-    fn can_paint(&self) -> bool {
-        self.camera.mode() == CameraMode::LockedOrtho && self.camera.is_front_view()
-    }
-
-    fn canvas_uv_at(&self, x: f32, y: f32) -> Option<(f32, f32)> {
-        let aspect = self.screen_size.0 / self.screen_size.1;
-        let (half_width, half_height) = self.camera.ortho_half_extents(aspect);
-        // pan_offset shifts the look-at target away from the origin —
-        // without adding it here, the UV mapping treats the camera as
-        // always looking at (0,0) in world space, so panning the canvas
-        // left then drawing puts ink somewhere off to the right.
-        let (pan_x, pan_y) = self.camera.pan_offset_xy();
-
-        let ndc_x = (x / self.screen_size.0) * 2.0 - 1.0;
-        let ndc_y = 1.0 - (y / self.screen_size.1) * 2.0;
-
-        let world_x = ndc_x * half_width + pan_x;
-        let world_y = ndc_y * half_height + pan_y;
-
-        let u = (world_x / self.canvas_half_size + 1.0) / 2.0;
-        let v = (1.0 - world_y / self.canvas_half_size) / 2.0;
-
-        if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
-            Some((u, v))
-        } else {
-            None
-        }
-    }
-
-    /// Force-commits whatever's pending, regardless of how much time has
-    /// elapsed. Called unconditionally from `pointer_up` (lifting proves
-    /// no pinch is coming) and conditionally from `maybe_commit_pending`
-    /// once the delay window has actually passed.
-    fn commit_pending(&mut self) -> Vec<DabPlan> {
-        let Some(pending) = self.pending_start.take() else { return Vec::new() };
-        let Some(uv) = self.canvas_uv_at(pending.position.0, pending.position.1) else {
-            return Vec::new();
-        };
-        self.is_painting = true;
-        self.brush_engine.start_stroke(uv)
-    }
-
-    fn maybe_commit_pending(&mut self) -> Vec<DabPlan> {
-        let ready = self
-            .pending_start
-            .as_ref()
-            .is_some_and(|p| p.started_at.elapsed() >= PAINT_START_DELAY);
-        if ready {
-            self.commit_pending()
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Call once per frame regardless of input events — this is what
-    /// lets a perfectly still single-finger touch (no Move samples at
-    /// all) still get its dab committed once the disambiguation window
-    /// passes, rather than only ever being checked from inside
-    /// `pointer_moved`.
-    pub fn tick(&mut self) -> Vec<DabPlan> {
-        self.maybe_commit_pending()
-    }
-
-    /// First finger down. Does NOT paint immediately — see module doc
-    /// comment. `ui_claims_pointer` is the caller's own UI layer's
-    /// answer to "is this pointer already being used by a widget."
-    pub fn pointer_down(&mut self, x: f32, y: f32, ui_claims_pointer: bool) -> Vec<DabPlan> {
-        self.last_pointer = Some((x, y));
-        self.is_painting = false;
-        self.pending_start = None;
-
-        if self.can_paint() && !ui_claims_pointer && self.canvas_uv_at(x, y).is_some() {
-            self.pending_start = Some(PendingStart { position: (x, y), started_at: Instant::now() });
-        }
-        Vec::new()
-    }
-
-    /// A second pointer touched down — drops any pending (not yet
-    /// committed) start outright, and cancels an already-committed
-    /// stroke too, covering both timings.
-    pub fn second_pointer_down(&mut self) {
-        if self.is_painting {
-            self.brush_engine.cancel_stroke();
-        }
-        self.is_painting = false;
-        self.pending_start = None;
-    }
-
-    /// `pointers` are ALL currently active pointers. Two or more drive
-    /// pinch-to-zoom AND two-finger pan (tracked via the pair's midpoint)
-    /// instead of painting or camera orbit; only the first pointer's
-    /// position is used otherwise.
-    pub fn pointer_moved(&mut self, pointers: &[(f32, f32)], ui_claims_pointer: bool) -> Vec<DabPlan> {
-        let Some(&(x, y)) = pointers.first() else { return Vec::new() };
-
-        if pointers.len() >= 2 {
-            let (x1, y1) = pointers[1];
-            let distance = ((x1 - x).powi(2) + (y1 - y).powi(2)).sqrt();
-            let midpoint = ((x + x1) * 0.5, (y + y1) * 0.5);
-
-            if let Some(last_dist) = self.last_pinch_distance {
-                self.camera.zoom(distance / last_dist.max(1.0));
+    loop {
+        app.poll_events(Some(Duration::from_millis(16)), |event| {
+            match event {
+                PollEvent::Main(MainEvent::InitWindow { .. }) => {
+                    if let Some(window) = app.native_window() {
+                        match GpuState::new(window) {
+                            Ok(state) => gpu = Some(state),
+                            Err(e) => log::error!("wgpu setup failed: {e}"),
+                        }
+                    }
+                }
+                PollEvent::Main(MainEvent::TerminateWindow { .. }) => {
+                    gpu = None;
+                }
+                PollEvent::Main(MainEvent::WindowResized { .. }) => {
+                    if let (Some(window), Some(state)) = (app.native_window(), gpu.as_mut()) {
+                        let width = window.width().max(1) as u32;
+                        let height = window.height().max(1) as u32;
+                        state.resize(width, height);
+                    }
+                }
+                _ => {}
             }
-            if let Some(last_mid) = self.last_pinch_midpoint {
-                self.camera.pan(
-                    midpoint.0 - last_mid.0,
-                    midpoint.1 - last_mid.1,
-                    self.screen_size.0,
-                    self.screen_size.1,
-                );
-            }
-            self.last_pinch_distance = Some(distance);
-            self.last_pinch_midpoint = Some(midpoint);
+        });
 
-            if self.is_painting {
-                self.brush_engine.cancel_stroke();
-            }
-            self.is_painting = false;
-            self.pending_start = None;
-            self.last_pointer = Some((x, y));
-            return Vec::new();
-        }
+        let pixels_per_point = app.config().density().unwrap_or(160) as f32 / 160.0;
 
-        self.last_pinch_distance = None;
-        self.last_pinch_midpoint = None;
-
-        let mut plans = self.maybe_commit_pending();
-
-        if self.is_painting {
-            if let Some(uv) = self.canvas_uv_at(x, y) {
-                plans.extend(self.brush_engine.push_point(uv));
-            }
-        } else if self.pending_start.is_none() {
-            // Still genuinely ambiguous (pending_start.is_some()) ->
-            // don't orbit either, just wait. Once neither painting nor
-            // pending, fall through to ordinary camera drag (a no-op in
-            // LockedOrtho regardless, via handle_drag's own mode check).
-            if let Some((lx, ly)) = self.last_pointer {
-                if !ui_claims_pointer {
-                    self.camera.handle_drag(x - lx, y - ly);
+        if let Ok(mut iter) = app.input_events_iter() {
+            loop {
+                let has_more = iter.next(|event| {
+                    if let InputEvent::MotionEvent(motion) = event {
+                        if let Some(state) = gpu.as_mut() {
+                            match motion.action() {
+                                MotionAction::Down => {
+                                    if let Some(p) = motion.pointers().next() {
+                                        state.touch_down(p.x(), p.y(), pixels_per_point);
+                                    }
+                                }
+                                MotionAction::PointerDown => {
+                                    state.second_touch_down();
+                                }
+                                MotionAction::Move => {
+                                    let pointers: Vec<(f32, f32)> =
+                                        motion.pointers().map(|p| (p.x(), p.y())).collect();
+                                    state.touch_move(&pointers, pixels_per_point);
+                                }
+                                MotionAction::Up | MotionAction::PointerUp | MotionAction::Cancel => {
+                                    if let Some(p) = motion.pointers().next() {
+                                        state.touch_up(p.x(), p.y(), pixels_per_point);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    InputStatus::Unhandled
+                });
+                if !has_more {
+                    break;
                 }
             }
         }
 
-        self.last_pointer = Some((x, y));
-        plans
-    }
-
-    pub fn pointer_up(&mut self, x: f32, y: f32) -> Vec<DabPlan> {
-        // Lifting is proof no second finger is coming for this gesture —
-        // force-commit a still-pending tap immediately rather than
-        // waiting out (or silently dropping) the disambiguation window.
-        let mut plans = self.commit_pending();
-
-        if self.is_painting {
-            if let Some(uv) = self.canvas_uv_at(x, y) {
-                plans.extend(self.brush_engine.push_point(uv));
+        if let Some(state) = gpu.as_mut() {
+            state.render(BACKGROUND, pixels_per_point);
+            if let Some(bytes) = state.take_pending_export() {
+                let status = save_export(&bytes);
+                state.set_export_status(status);
             }
-            plans.extend(self.brush_engine.end_stroke());
         }
-
-        self.last_pointer = None;
-        self.last_pinch_distance = None;
-        self.last_pinch_midpoint = None;
-        self.is_painting = false;
-        self.pending_start = None;
-        plans
     }
-            }
+        }
