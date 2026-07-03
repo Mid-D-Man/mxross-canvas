@@ -87,6 +87,28 @@ struct BackgroundUniform {
     data: [f32; 4],
 }
 
+/// Erasing reuses the exact same dab shape/falloff shader as painting
+/// (`canvas_stamp.wgsl` — see its `fs_main` doc comment) — only the
+/// blend state differs. `src_factor: Zero` on both channels means the
+/// dab's own color is never written; `dst_factor: OneMinusSrcAlpha`
+/// scales down whatever's already on the canvas by `(1 - dab_alpha)` at
+/// every pixel the dab covers. Since `dab_alpha` already carries the
+/// shader's circular falloff, a dab erases with the same soft edge it
+/// would paint with, instead of punching a hard-edged stencil hole the
+/// way `BlendState::REPLACE` with a transparent color would.
+const ERASE_BLEND: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Zero,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Zero,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    },
+};
+
 pub struct PaintCanvas {
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
@@ -97,6 +119,7 @@ pub struct PaintCanvas {
     camera_buffer: wgpu::Buffer,
     background_buffer: wgpu::Buffer,
     stamp_pipeline: wgpu::RenderPipeline,
+    erase_pipeline: wgpu::RenderPipeline,
 }
 
 impl PaintCanvas {
@@ -313,43 +336,23 @@ impl PaintCanvas {
             immediate_size: 0,
         });
 
-        let stamp_vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<StampVertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 8, shader_location: 1 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 2 },
-            ],
-        };
-
-        // No depth_stencil here — the stamp pass targets the canvas
-        // texture directly, which has no depth attachment at all.
-        let stamp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("paint canvas stamp pipeline"),
-            layout: Some(&stamp_layout),
-            vertex: wgpu::VertexState {
-                module: &stamp_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[stamp_vertex_layout],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &stamp_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        // Same shader, same vertex layout, same "no depth" targeting for
+        // both paint and erase — only the blend state differs, so both
+        // pipelines come from this one helper.
+        let stamp_pipeline = Self::create_stamp_pipeline(
+            device,
+            &stamp_shader,
+            &stamp_layout,
+            wgpu::BlendState::ALPHA_BLENDING,
+            "paint canvas stamp pipeline",
+        );
+        let erase_pipeline = Self::create_stamp_pipeline(
+            device,
+            &stamp_shader,
+            &stamp_layout,
+            ERASE_BLEND,
+            "paint canvas erase pipeline",
+        );
 
         Self {
             texture,
@@ -361,7 +364,55 @@ impl PaintCanvas {
             camera_buffer,
             background_buffer,
             stamp_pipeline,
+            erase_pipeline,
         }
+    }
+
+    /// Shared by both stamp pipelines (paint + erase). No depth_stencil
+    /// here — the stamp pass targets the canvas texture directly, which
+    /// has no depth attachment at all.
+    fn create_stamp_pipeline(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        layout: &wgpu::PipelineLayout,
+        blend: wgpu::BlendState,
+        label: &str,
+    ) -> wgpu::RenderPipeline {
+        let vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<StampVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 8, shader_location: 1 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 2 },
+            ],
+        };
+
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_main"),
+                buffers: &[vertex_layout],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(blend),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
     }
 
     pub fn set_camera(&self, queue: &wgpu::Queue, view_proj: Mat4) {
@@ -399,6 +450,26 @@ impl PaintCanvas {
     /// Stamps every dab in `dabs` in one render pass — one encoder, one
     /// vertex/index buffer covering the whole batch, one submit.
     pub fn stamp_many(&self, device: &wgpu::Device, queue: &wgpu::Queue, dabs: &[Dab]) {
+        self.stamp_with_pipeline(device, queue, dabs, &self.stamp_pipeline);
+    }
+
+    /// Same batching strategy as `stamp_many`, routed through
+    /// `erase_pipeline` instead — see its doc comment / `ERASE_BLEND`
+    /// for why this is the same dab shape with a different blend state
+    /// rather than a separate code path. `dab.color`'s alpha still
+    /// matters (it's the erase strength); its rgb doesn't, since
+    /// `ERASE_BLEND` never writes source color.
+    pub fn erase_many(&self, device: &wgpu::Device, queue: &wgpu::Queue, dabs: &[Dab]) {
+        self.stamp_with_pipeline(device, queue, dabs, &self.erase_pipeline);
+    }
+
+    fn stamp_with_pipeline(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        dabs: &[Dab],
+        pipeline: &wgpu::RenderPipeline,
+    ) {
         if dabs.is_empty() {
             return;
         }
@@ -452,7 +523,7 @@ impl PaintCanvas {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.stamp_pipeline);
+            pass.set_pipeline(pipeline);
             pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
@@ -533,4 +604,4 @@ impl PaintCanvas {
 
         (TEXTURE_SIZE, TEXTURE_SIZE, pixels)
     }
-            }
+}
