@@ -10,11 +10,20 @@ use mxross_camera::{CameraMode, OrbitCamera};
 use mxross_render_gpu::BackgroundMode;
 
 use crate::gizmo;
+use crate::gpu::Tool;
 
 pub struct AppUi {
     ctx: egui::Context,
     pointer_over_ui: bool,
     background_toggle_requested: bool,
+    tool_toggle_requested: bool,
+    /// Set whenever the brush-size slider is dragged to a new value this
+    /// frame — `Option` rather than a bare `f32` so `take_...` can tell
+    /// "no change happened" apart from "changed back to the same value
+    /// it already was," even though the latter would be harmless either
+    /// way. Consistent with the take-and-clear pattern every other
+    /// one-shot UI request in this struct already uses.
+    brush_radius_change: Option<f32>,
     export_requested: bool,
     /// The actual result of the last export attempt — set from outside
     /// (gpu.rs, after lib.rs has tried writing the file) since this is
@@ -31,6 +40,8 @@ impl AppUi {
             ctx: egui::Context::default(),
             pointer_over_ui: false,
             background_toggle_requested: false,
+            tool_toggle_requested: false,
+            brush_radius_change: None,
             export_requested: false,
             last_export_status: None,
             start: Instant::now(),
@@ -53,6 +64,14 @@ impl AppUi {
         std::mem::take(&mut self.export_requested)
     }
 
+    pub fn take_tool_toggle_requested(&mut self) -> bool {
+        std::mem::take(&mut self.tool_toggle_requested)
+    }
+
+    pub fn take_brush_radius_change(&mut self) -> Option<f32> {
+        self.brush_radius_change.take()
+    }
+
     /// Called from gpu.rs once the actual file write (done in lib.rs,
     /// which is the only place that knows the Android storage path) has
     /// either succeeded or failed.
@@ -64,6 +83,8 @@ impl AppUi {
         &mut self,
         camera: &mut OrbitCamera,
         background_mode: BackgroundMode,
+        tool: Tool,
+        brush_radius: f32,
         events: Vec<egui::Event>,
         screen_size_px: (u32, u32),
         pixels_per_point: f32,
@@ -95,6 +116,8 @@ impl AppUi {
         let mut clicked_background = false;
         let mut clicked_export = false;
         let mut clicked_focus = false;
+        let mut clicked_tool = false;
+        let mut new_radius = None;
 
         let output = self.ctx.run_ui(raw_input, |ui| {
             egui::Area::new(egui::Id::new("camera_mode_toggle"))
@@ -139,6 +162,41 @@ impl AppUi {
                     }
                 });
 
+            egui::Area::new(egui::Id::new("tool_toggle"))
+                .fixed_pos(egui::pos2(16.0, 256.0))
+                .show(ui.ctx(), |ui| {
+                    if ui.button(tool.label()).clicked() {
+                        clicked_tool = true;
+                    }
+                });
+
+            egui::Area::new(egui::Id::new("brush_size_slider"))
+                .fixed_pos(egui::pos2(16.0, 296.0))
+                .show(ui.ctx(), |ui| {
+                    // Background panel for the same reason export_status
+                    // gets one — a bare slider is hard to see against a
+                    // busy painted canvas.
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_black_alpha(180))
+                        .corner_radius(4.0)
+                        .inner_margin(6.0)
+                        .show(ui, |ui| {
+                            let mut radius = brush_radius;
+                            // 2..=64 canvas-texture px (same unit
+                            // BrushPreset::radius_px already uses). 2 is
+                            // small-but-usable at the 1024px canvas
+                            // resolution; 64 is wide enough to matter
+                            // without the slider being mostly dead
+                            // space. Tune by feel on-device.
+                            let response = ui.add(
+                                egui::Slider::new(&mut radius, 2.0..=64.0).text("Brush Size"),
+                            );
+                            if response.changed() {
+                                new_radius = Some(radius);
+                            }
+                        });
+                });
+
             if let Some(status) = &export_status {
                 egui::Area::new(egui::Id::new("export_status"))
                     .fixed_pos(egui::pos2(16.0, 176.0))
@@ -178,6 +236,12 @@ impl AppUi {
         if clicked_focus {
             camera.focus_canvas();
         }
+        if clicked_tool {
+            self.tool_toggle_requested = true;
+        }
+        if let Some(radius) = new_radius {
+            self.brush_radius_change = Some(radius);
+        }
 
         self.pointer_over_ui = self.ctx.egui_wants_pointer_input();
 
@@ -189,4 +253,4 @@ impl Default for AppUi {
     fn default() -> Self {
         Self::new()
     }
-}
+    }
