@@ -85,6 +85,15 @@ impl CanvasController {
         &mut self.camera
     }
 
+    /// Immutable counterpart to `brush_preset_mut()` — needed so
+    /// `gpu.rs` can read the current radius for the UI slider in the
+    /// same frame it also needs `camera_mut()`; without a separate
+    /// immutable accessor, both would have to borrow `self.controller`
+    /// mutably at once.
+    pub fn brush_preset(&self) -> &BrushPreset {
+        self.brush_engine.preset()
+    }
+
     pub fn brush_preset_mut(&mut self) -> &mut BrushPreset {
         self.brush_engine.preset_mut()
     }
@@ -305,4 +314,4 @@ impl CanvasController {
         self.pending_start = None;
         plans
     }
-        }
+                     }
