@@ -209,6 +209,30 @@ impl GpuState {
         self.controller.resize(width as f32, height as f32);
     }
 
+    /// Reads the canvas back to CPU-side pixels — called right before
+    /// this whole `GpuState` (including the GPU texture holding the
+    /// painting) is dropped on `TerminateWindow`. Android backgrounding
+    /// tears down the native window, and this app's response to that is
+    /// to fully tear down and later rebuild the wgpu Device/Surface/
+    /// canvas from scratch (see lib.rs) rather than try to keep a GPU
+    /// context alive across it — safe, but it means the painting itself
+    /// needs to survive that boundary by some other route. This is that
+    /// route: lib.rs holds onto the returned pixels outside `GpuState`
+    /// and hands them to `restore_canvas` once the next `GpuState::new`
+    /// succeeds. Without this, every backgrounding/minimize silently
+    /// wiped the painting.
+    pub fn snapshot_canvas(&self) -> Vec<u8> {
+        let (_, _, pixels) = self.canvas.read_pixels(&self.device, &self.queue);
+        pixels
+    }
+
+    /// Restores a snapshot from `snapshot_canvas` into a freshly created
+    /// canvas. No-op if the pixel count doesn't match this canvas's
+    /// resolution (see `PaintCanvas::write_pixels`).
+    pub fn restore_canvas(&mut self, pixels: &[u8]) {
+        self.canvas.write_pixels(&self.queue, pixels);
+    }
+
     fn apply_dabs(&self, plans: Vec<DabPlan>) {
         if plans.is_empty() {
             return;
@@ -411,4 +435,4 @@ impl GpuState {
             self.egui_renderer.free_texture(id);
         }
     }
-}
+    }
