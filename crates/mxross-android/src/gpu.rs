@@ -41,6 +41,36 @@ use crate::ui::AppUi;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// Which GPU stamp pipeline `apply_dabs` routes dabs through. Lives here
+/// rather than in `mxross-brush` or `mxross-interaction` because nothing
+/// about a stroke's shape, smoothing, or spacing changes between paint
+/// and erase — only which blend state paints it onto the canvas
+/// texture, and that decision already belongs exclusively to this file
+/// (see the crate-level doc comment on `apply_dabs` below). Both tools
+/// share the same `BrushPreset` (radius/spacing), so the brush-size
+/// slider affects whichever tool is currently selected.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Tool {
+    Paint,
+    Erase,
+}
+
+impl Tool {
+    fn toggled(self) -> Self {
+        match self {
+            Tool::Paint => Tool::Erase,
+            Tool::Erase => Tool::Paint,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tool::Paint => "Tool: Brush",
+            Tool::Erase => "Tool: Eraser",
+        }
+    }
+}
+
 struct WindowHandles {
     native_window: NativeWindow,
 }
@@ -66,6 +96,7 @@ pub struct GpuState {
     canvas: PaintCanvas,
     controller: CanvasController,
     background_mode: BackgroundMode,
+    tool: Tool,
     ui: AppUi,
     egui_renderer: egui_wgpu::Renderer,
     pending_ui_events: Vec<egui::Event>,
@@ -145,6 +176,7 @@ impl GpuState {
             canvas,
             controller,
             background_mode: BackgroundMode::Transparent,
+            tool: Tool::Paint,
             ui: AppUi::new(),
             egui_renderer,
             pending_ui_events: Vec::new(),
@@ -185,7 +217,10 @@ impl GpuState {
             .into_iter()
             .map(|p| Dab { position: p.position, radius_px: p.radius_px, color: p.color })
             .collect();
-        self.canvas.stamp_many(&self.device, &self.queue, &dabs);
+        match self.tool {
+            Tool::Paint => self.canvas.stamp_many(&self.device, &self.queue, &dabs),
+            Tool::Erase => self.canvas.erase_many(&self.device, &self.queue, &dabs),
+        }
     }
 
     pub fn touch_down(&mut self, x: f32, y: f32, pixels_per_point: f32) {
@@ -260,9 +295,15 @@ impl GpuState {
         self.canvas.set_camera(&self.queue, self.controller.camera().view_proj(aspect));
 
         let events = std::mem::take(&mut self.pending_ui_events);
+        // Read before the mutable camera borrow below — brush_preset()
+        // and camera_mut() both borrow self.controller, and only one
+        // mutable borrow of it can be alive at a time.
+        let current_radius = self.controller.brush_preset().radius_px;
         let output = self.ui.run_frame(
             self.controller.camera_mut(),
             self.background_mode,
+            self.tool,
+            current_radius,
             events,
             (self.config.width, self.config.height),
             pixels_per_point,
@@ -274,6 +315,14 @@ impl GpuState {
                 BackgroundMode::Solid(_) => BackgroundMode::Transparent,
             };
             self.canvas.set_background_mode(&self.queue, self.background_mode);
+        }
+
+        if self.ui.take_tool_toggle_requested() {
+            self.tool = self.tool.toggled();
+        }
+
+        if let Some(radius) = self.ui.take_brush_radius_change() {
+            self.controller.brush_preset_mut().radius_px = radius;
         }
 
         if self.ui.take_export_request() {
@@ -362,4 +411,4 @@ impl GpuState {
             self.egui_renderer.free_texture(id);
         }
     }
-                                 }
+}
