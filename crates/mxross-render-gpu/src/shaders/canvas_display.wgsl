@@ -33,13 +33,24 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 }
 
 // Standard two-shade checkerboard, the universal "this is actually
-// transparent" indicator. Scaled in UV space, so checker cells scale
-// with zoom rather than staying a fixed screen size — a reasonable
-// simplification for now, not something every painting app even agrees
-// on (some keep cells screen-space-constant, which would need the
-// current zoom/resolution passed in too).
-fn checker_color(uv: vec2<f32>) -> vec3<f32> {
-    let cell = floor(uv * 32.0);
+// transparent" indicator. Fixed in SCREEN space (physical pixels), not
+// canvas UV space — this is the standard behavior in Photoshop/Krita/
+// Procreate: the checker pattern stays a constant on-screen cell size
+// and doesn't zoom with the canvas content. Doing it in UV space (the
+// old approach) meant cells grew huge when zoomed in and shrank into a
+// shimmering, aliased mess when zoomed out — this is the "checker
+// pattern with the zoom" issue.
+//
+// `frag_coord` is `@builtin(position)` read in the fragment stage,
+// which WGSL/the rasterizer resolves to the actual window-space pixel
+// coordinate of this fragment (NOT the clip-space value the vertex
+// stage wrote into the same field) — equivalent to GLSL's gl_FragCoord.
+// So no extra uniform is needed to know "current zoom/resolution": the
+// hardware already hands us physical pixel coordinates directly.
+const CHECKER_CELL_PX: f32 = 24.0;
+
+fn checker_color(frag_coord: vec2<f32>) -> vec3<f32> {
+    let cell = floor(frag_coord / CHECKER_CELL_PX);
     let parity = (cell.x + cell.y) % 2.0;
     return mix(vec3<f32>(0.82, 0.82, 0.82), vec3<f32>(0.64, 0.64, 0.64), parity);
 }
@@ -49,7 +60,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let canvas_color = textureSample(canvas_texture, canvas_sampler, input.uv);
     // background.a selects checker (0.0) vs solid color (1.0) as the
     // backdrop; the canvas's own alpha then composites over *that*.
-    let backdrop = mix(checker_color(input.uv), background.rgb, background.a);
+    let backdrop = mix(checker_color(input.clip_position.xy), background.rgb, background.a);
     let rgb = mix(backdrop, canvas_color.rgb, canvas_color.a);
     return vec4<f32>(rgb, 1.0);
 }
