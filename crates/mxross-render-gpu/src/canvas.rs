@@ -138,7 +138,8 @@ impl PaintCanvas {
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -604,4 +605,32 @@ impl PaintCanvas {
 
         (TEXTURE_SIZE, TEXTURE_SIZE, pixels)
     }
-}
+
+    /// Inverse of `read_pixels`: uploads tightly-packed RGBA8 straight
+    /// into the canvas texture. `queue.write_texture` does its own
+    /// internal staging, so unlike `read_pixels` no 256-byte row
+    /// alignment handling is needed on this side.
+    ///
+    /// No-op (rather than panicking) if `pixels` isn't exactly
+    /// `TEXTURE_SIZE * TEXTURE_SIZE * 4` bytes — a snapshot taken at a
+    /// canvas resolution that doesn't match this texture should just be
+    /// dropped, not crash the app on resume.
+    pub fn write_pixels(&self, queue: &wgpu::Queue, pixels: &[u8]) {
+        const BYTES_PER_PIXEL: u32 = 4; // Rgba8Unorm
+        let expected = (TEXTURE_SIZE * TEXTURE_SIZE * BYTES_PER_PIXEL) as usize;
+        if pixels.len() != expected {
+            return;
+        }
+
+        queue.write_texture(
+            self.texture.as_image_copy(),
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(TEXTURE_SIZE * BYTES_PER_PIXEL),
+                rows_per_image: Some(TEXTURE_SIZE),
+            },
+            wgpu::Extent3d { width: TEXTURE_SIZE, height: TEXTURE_SIZE, depth_or_array_layers: 1 },
+        );
+    }
+    }
