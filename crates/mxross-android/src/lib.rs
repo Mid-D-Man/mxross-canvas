@@ -60,6 +60,10 @@ fn android_main(app: AndroidApp) {
     install_panic_hook(&app);
 
     let mut gpu: Option<GpuState> = None;
+    // Carries the painting across a TerminateWindow/InitWindow rebuild —
+    // see GpuState::snapshot_canvas's doc comment for why this can't
+    // just live inside GpuState itself.
+    let mut canvas_snapshot: Option<Vec<u8>> = None;
 
     loop {
         app.poll_events(Some(Duration::from_millis(16)), |event| {
@@ -67,13 +71,20 @@ fn android_main(app: AndroidApp) {
                 PollEvent::Main(MainEvent::InitWindow { .. }) => {
                     if let Some(window) = app.native_window() {
                         match GpuState::new(window) {
-                            Ok(state) => gpu = Some(state),
+                            Ok(mut state) => {
+                                if let Some(pixels) = canvas_snapshot.take() {
+                                    state.restore_canvas(&pixels);
+                                }
+                                gpu = Some(state);
+                            }
                             Err(e) => log::error!("wgpu setup failed: {e}"),
                         }
                     }
                 }
                 PollEvent::Main(MainEvent::TerminateWindow { .. }) => {
-                    gpu = None;
+                    if let Some(state) = gpu.take() {
+                        canvas_snapshot = Some(state.snapshot_canvas());
+                    }
                 }
                 PollEvent::Main(MainEvent::WindowResized { .. }) => {
                     if let (Some(window), Some(state)) = (app.native_window(), gpu.as_mut()) {
