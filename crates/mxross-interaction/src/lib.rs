@@ -93,7 +93,11 @@ impl CanvasController {
         self.camera.mode() == CameraMode::LockedOrtho && self.camera.is_front_view()
     }
 
-    fn canvas_uv_at(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+    /// Shared screen-to-canvas-UV math. Returns UV *unclamped* — callers
+    /// decide whether an out-of-[0,1] result means "not on the canvas"
+    /// (use `canvas_uv_at`) or "still draw, just pinned to the edge"
+    /// (use `canvas_uv_clamped`).
+    fn canvas_uv_raw(&self, x: f32, y: f32) -> (f32, f32) {
         let aspect = self.screen_size.0 / self.screen_size.1;
         let (half_width, half_height) = self.camera.ortho_half_extents(aspect);
         // pan_offset shifts the look-at target away from the origin —
@@ -110,7 +114,15 @@ impl CanvasController {
 
         let u = (world_x / self.canvas_half_size + 1.0) / 2.0;
         let v = (1.0 - world_y / self.canvas_half_size) / 2.0;
+        (u, v)
+    }
 
+    /// `None` unless `(x, y)` actually lands on the canvas. Used for
+    /// "is this position on the canvas at all" decisions: whether a tap
+    /// is eligible to start a stroke, whether a pending touch has
+    /// crossed onto the canvas yet.
+    fn canvas_uv_at(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        let (u, v) = self.canvas_uv_raw(x, y);
         if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
             Some((u, v))
         } else {
@@ -118,15 +130,35 @@ impl CanvasController {
         }
     }
 
+    /// Always returns a UV, pinned to the canvas edge if `(x, y)` is
+    /// outside it. Used to *continue* an already-committed stroke: once
+    /// painting has started, a finger that drifts off the canvas edge
+    /// should keep drawing right up to (and along) the border instead of
+    /// silently stopping, which is what leaves a gap at the edge where
+    /// the last in-bounds dab landed short of where the finger actually
+    /// left the canvas.
+    fn canvas_uv_clamped(&self, x: f32, y: f32) -> (f32, f32) {
+        let (u, v) = self.canvas_uv_raw(x, y);
+        (u.clamp(0.0, 1.0), v.clamp(0.0, 1.0))
+    }
+
     /// Force-commits whatever's pending, regardless of how much time has
     /// elapsed. Called unconditionally from `pointer_up` (lifting proves
     /// no pinch is coming) and conditionally from `maybe_commit_pending`
     /// once the delay window has actually passed.
+    /// Deliberately does NOT drop `pending_start` when the position isn't
+    /// on the canvas yet — a touch that starts outside the canvas and
+    /// drags inward should start painting the moment it crosses the
+    /// edge, not be discarded the first time this is called while it's
+    /// still off-canvas. `pointer_moved` keeps `pending.position` fresh
+    /// every frame (see below), so this re-checks the *current* position
+    /// each time, not the original touch-down position.
     fn commit_pending(&mut self) -> Vec<DabPlan> {
-        let Some(pending) = self.pending_start.take() else { return Vec::new() };
+        let Some(pending) = self.pending_start.as_ref() else { return Vec::new() };
         let Some(uv) = self.canvas_uv_at(pending.position.0, pending.position.1) else {
             return Vec::new();
         };
+        self.pending_start = None;
         self.is_painting = true;
         self.brush_engine.start_stroke(uv)
     }
@@ -160,7 +192,13 @@ impl CanvasController {
         self.is_painting = false;
         self.pending_start = None;
 
-        if self.can_paint() && !ui_claims_pointer && self.canvas_uv_at(x, y).is_some() {
+        // No canvas_uv_at(x, y).is_some() gate here on purpose — a touch
+        // that starts outside the canvas (e.g. dragging in from off the
+        // edge) still needs to become a pending start so it can be
+        // committed once it drags onto the canvas. In LockedOrtho,
+        // camera drag is a no-op anyway, so holding a pending start that
+        // never resolves costs nothing.
+        if self.can_paint() && !ui_claims_pointer {
             self.pending_start = Some(PendingStart { position: (x, y), started_at: Instant::now() });
         }
         Vec::new()
@@ -215,12 +253,23 @@ impl CanvasController {
         self.last_pinch_distance = None;
         self.last_pinch_midpoint = None;
 
+        // Keep the pending start's position fresh so a touch that began
+        // off-canvas commits at wherever it actually is now, not the
+        // stale off-canvas down position — this is what lets it commit
+        // the instant it crosses onto the canvas.
+        if let Some(pending) = self.pending_start.as_mut() {
+            pending.position = (x, y);
+        }
+
         let mut plans = self.maybe_commit_pending();
 
         if self.is_painting {
-            if let Some(uv) = self.canvas_uv_at(x, y) {
-                plans.extend(self.brush_engine.push_point(uv));
-            }
+            // Clamped, not the strict Option version: once a stroke is
+            // committed, a finger drifting off the canvas edge should
+            // keep drawing pinned to the border rather than leaving a
+            // gap between the last in-bounds dab and the edge.
+            let uv = self.canvas_uv_clamped(x, y);
+            plans.extend(self.brush_engine.push_point(uv));
         } else if self.pending_start.is_none() {
             // Still genuinely ambiguous (pending_start.is_some()) ->
             // don't orbit either, just wait. Once neither painting nor
@@ -244,9 +293,8 @@ impl CanvasController {
         let mut plans = self.commit_pending();
 
         if self.is_painting {
-            if let Some(uv) = self.canvas_uv_at(x, y) {
-                plans.extend(self.brush_engine.push_point(uv));
-            }
+            let uv = self.canvas_uv_clamped(x, y);
+            plans.extend(self.brush_engine.push_point(uv));
             plans.extend(self.brush_engine.end_stroke());
         }
 
