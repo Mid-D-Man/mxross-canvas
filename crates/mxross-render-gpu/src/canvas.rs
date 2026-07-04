@@ -18,10 +18,27 @@ use wgpu::util::DeviceExt;
 
 use mxross_math::Mat4;
 
-const TEXTURE_SIZE: u32 = 1024;
-/// Half-extent of the canvas plane in world units — the plane spans
-/// -CANVAS_HALF_SIZE..CANVAS_HALF_SIZE on both X and Y, at Z=0.
-const CANVAS_HALF_SIZE: f32 = 2.0;
+/// Half-extent of the *longer* edge of the canvas plane in world units,
+/// at a 1:1 (square) aspect ratio. Actual per-canvas half-extents are
+/// computed from this plus the canvas's real aspect ratio so a
+/// landscape or portrait canvas gets a proportionally-shaped plane
+/// instead of always being forced square in world space — see
+/// `half_extents_for`.
+const CANVAS_BASE_HALF_SIZE: f32 = 2.0;
+
+/// Given a canvas resolution, returns `(half_width, half_height)` in
+/// world units: the longer edge is always `CANVAS_BASE_HALF_SIZE`, the
+/// shorter edge scaled down to match the true aspect ratio. Keeps a
+/// 1920x1080 canvas looking like a landscape rectangle in world space
+/// rather than a square with letterboxing.
+fn half_extents_for(width_px: u32, height_px: u32) -> (f32, f32) {
+    let aspect = width_px as f32 / height_px as f32;
+    if aspect >= 1.0 {
+        (CANVAS_BASE_HALF_SIZE, CANVAS_BASE_HALF_SIZE / aspect)
+    } else {
+        (CANVAS_BASE_HALF_SIZE * aspect, CANVAS_BASE_HALF_SIZE)
+    }
+}
 
 /// One dab to draw: where (canvas UV, 0..1, top-left origin), how big
 /// (canvas texture pixels), what color. Plain data — no brush concepts
@@ -112,6 +129,10 @@ const ERASE_BLEND: wgpu::BlendState = wgpu::BlendState {
 pub struct PaintCanvas {
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
+    width_px: u32,
+    height_px: u32,
+    half_width: f32,
+    half_height: f32,
     display_pipeline: wgpu::RenderPipeline,
     display_vertex_buffer: wgpu::Buffer,
     display_index_buffer: wgpu::Buffer,
@@ -123,15 +144,20 @@ pub struct PaintCanvas {
 }
 
 impl PaintCanvas {
+    /// `width_px`/`height_px` need not be square — see `half_extents_for`
+    /// for how a non-square resolution shapes the world-space plane.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         surface_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
+        width_px: u32,
+        height_px: u32,
     ) -> Self {
+        let (half_width, half_height) = half_extents_for(width_px, height_px);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("paint canvas texture"),
-            size: wgpu::Extent3d { width: TEXTURE_SIZE, height: TEXTURE_SIZE, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width: width_px, height: height_px, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -306,12 +332,11 @@ impl PaintCanvas {
             cache: None,
         });
 
-        let half = CANVAS_HALF_SIZE;
         let vertices = [
-            DisplayVertex { position: [-half,  half, 0.0], uv: [0.0, 0.0] }, // top-left
-            DisplayVertex { position: [ half,  half, 0.0], uv: [1.0, 0.0] }, // top-right
-            DisplayVertex { position: [ half, -half, 0.0], uv: [1.0, 1.0] }, // bottom-right
-            DisplayVertex { position: [-half, -half, 0.0], uv: [0.0, 1.0] }, // bottom-left
+            DisplayVertex { position: [-half_width,  half_height, 0.0], uv: [0.0, 0.0] }, // top-left
+            DisplayVertex { position: [ half_width,  half_height, 0.0], uv: [1.0, 0.0] }, // top-right
+            DisplayVertex { position: [ half_width, -half_height, 0.0], uv: [1.0, 1.0] }, // bottom-right
+            DisplayVertex { position: [-half_width, -half_height, 0.0], uv: [0.0, 1.0] }, // bottom-left
         ];
         let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
 
@@ -358,6 +383,10 @@ impl PaintCanvas {
         Self {
             texture,
             texture_view,
+            width_px,
+            height_px,
+            half_width,
+            half_height,
             display_pipeline,
             display_vertex_buffer,
             display_index_buffer,
@@ -435,17 +464,19 @@ impl PaintCanvas {
         );
     }
 
-    /// Half-extent of the canvas plane in world units — exposed so the
-    /// caller can convert a touch position into canvas UV.
-    pub fn half_size(&self) -> f32 {
-        CANVAS_HALF_SIZE
+    /// Half-extents `(half_width, half_height)` of the canvas plane in
+    /// world units — exposed so the caller can convert a touch position
+    /// into canvas UV. Not necessarily square — see `half_extents_for`.
+    pub fn half_extents(&self) -> (f32, f32) {
+        (self.half_width, self.half_height)
     }
 
-    /// Texture resolution in pixels (square) — exposed so callers can
-    /// convert UV-space distances into canvas-pixel distances. Needed by
-    /// mxross-brush's spacing calculation, which works in real pixels.
-    pub fn texture_size_px(&self) -> f32 {
-        TEXTURE_SIZE as f32
+    /// Texture resolution in pixels as `(width, height)` — exposed so
+    /// callers can convert UV-space distances into canvas-pixel
+    /// distances. Needed by mxross-brush's spacing calculation, which
+    /// works in real pixels. Not necessarily square.
+    pub fn texture_size_px(&self) -> (f32, f32) {
+        (self.width_px as f32, self.height_px as f32)
     }
 
     /// Stamps every dab in `dabs` in one render pass — one encoder, one
@@ -481,11 +512,19 @@ impl PaintCanvas {
         for dab in dabs {
             let base = vertices.len() as u16;
             let center_ndc = [dab.position.0 * 2.0 - 1.0, 1.0 - dab.position.1 * 2.0];
-            let radius_ndc = dab.radius_px / TEXTURE_SIZE as f32 * 2.0;
+            // Stamping happens directly in the texture's own NDC space
+            // (-1..1 over the whole texture, regardless of its pixel
+            // aspect ratio) — a single NDC radius would stretch a dab
+            // into an ellipse the moment width_px != height_px, since
+            // the same NDC delta covers a different pixel count on each
+            // axis. Scaling x and y separately keeps a dab's real-pixel
+            // footprint circular no matter the canvas's aspect ratio.
+            let radius_ndc_x = dab.radius_px / self.width_px as f32 * 2.0;
+            let radius_ndc_y = dab.radius_px / self.height_px as f32 * 2.0;
 
             for &(lx, ly) in &[(-1.0_f32, 1.0), (1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
                 vertices.push(StampVertex {
-                    position: [center_ndc[0] + lx * radius_ndc, center_ndc[1] + ly * radius_ndc],
+                    position: [center_ndc[0] + lx * radius_ndc_x, center_ndc[1] + ly * radius_ndc_y],
                     local: [lx, ly],
                     color: dab.color,
                 });
@@ -551,14 +590,15 @@ impl PaintCanvas {
     /// plumbing here.
     pub fn read_pixels(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> (u32, u32, Vec<u8>) {
         const BYTES_PER_PIXEL: u32 = 4; // Rgba8Unorm
+        let (width, height) = (self.width_px, self.height_px);
 
-        let unpadded_bytes_per_row = TEXTURE_SIZE * BYTES_PER_PIXEL;
+        let unpadded_bytes_per_row = width * BYTES_PER_PIXEL;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
 
         let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("paint canvas readback buffer"),
-            size: (padded_bytes_per_row * TEXTURE_SIZE) as wgpu::BufferAddress,
+            size: (padded_bytes_per_row * height) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -573,10 +613,10 @@ impl PaintCanvas {
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_bytes_per_row),
-                    rows_per_image: Some(TEXTURE_SIZE),
+                    rows_per_image: Some(height),
                 },
             },
-            wgpu::Extent3d { width: TEXTURE_SIZE, height: TEXTURE_SIZE, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
         queue.submit(std::iter::once(encoder.finish()));
 
@@ -594,8 +634,8 @@ impl PaintCanvas {
             .expect("buffer mapping failed");
 
         let mapped = buffer_slice.get_mapped_range();
-        let mut pixels = Vec::with_capacity((unpadded_bytes_per_row * TEXTURE_SIZE) as usize);
-        for row in 0..TEXTURE_SIZE {
+        let mut pixels = Vec::with_capacity((unpadded_bytes_per_row * height) as usize);
+        for row in 0..height {
             let start = (row * padded_bytes_per_row) as usize;
             let end = start + unpadded_bytes_per_row as usize;
             pixels.extend_from_slice(&mapped[start..end]);
@@ -603,7 +643,7 @@ impl PaintCanvas {
         drop(mapped);
         output_buffer.unmap();
 
-        (TEXTURE_SIZE, TEXTURE_SIZE, pixels)
+        (width, height, pixels)
     }
 
     /// Inverse of `read_pixels`: uploads tightly-packed RGBA8 straight
@@ -612,12 +652,13 @@ impl PaintCanvas {
     /// alignment handling is needed on this side.
     ///
     /// No-op (rather than panicking) if `pixels` isn't exactly
-    /// `TEXTURE_SIZE * TEXTURE_SIZE * 4` bytes — a snapshot taken at a
-    /// canvas resolution that doesn't match this texture should just be
+    /// `width_px * height_px * 4` bytes for THIS canvas — a snapshot
+    /// taken at a resolution that doesn't match the current canvas
+    /// (e.g. after a "New Canvas" at a different size) should just be
     /// dropped, not crash the app on resume.
     pub fn write_pixels(&self, queue: &wgpu::Queue, pixels: &[u8]) {
         const BYTES_PER_PIXEL: u32 = 4; // Rgba8Unorm
-        let expected = (TEXTURE_SIZE * TEXTURE_SIZE * BYTES_PER_PIXEL) as usize;
+        let expected = (self.width_px * self.height_px * BYTES_PER_PIXEL) as usize;
         if pixels.len() != expected {
             return;
         }
@@ -627,10 +668,10 @@ impl PaintCanvas {
             pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(TEXTURE_SIZE * BYTES_PER_PIXEL),
-                rows_per_image: Some(TEXTURE_SIZE),
+                bytes_per_row: Some(self.width_px * BYTES_PER_PIXEL),
+                rows_per_image: Some(self.height_px),
             },
-            wgpu::Extent3d { width: TEXTURE_SIZE, height: TEXTURE_SIZE, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width: self.width_px, height: self.height_px, depth_or_array_layers: 1 },
         );
     }
-    }
+        }
