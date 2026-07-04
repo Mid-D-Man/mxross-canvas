@@ -469,13 +469,13 @@ impl GpuState {
             });
         }
 
-        self.present(output, pixels_per_point);
+        self.present(output, pixels_per_point, clear_color);
     }
 
     /// Shared by both screens — a `Screen::Setup` frame has no canvas to
     /// draw, but still needs the same surface-acquire/egui-render/submit
     /// machinery as a `Screen::Painting` one.
-    fn present(&mut self, output: egui::FullOutput, pixels_per_point: f32) {
+    fn present(&mut self, output: egui::FullOutput, pixels_per_point: f32, clear_color: wgpu::Color) {
         let paint_jobs = self.ui.ctx().tessellate(output.shapes, output.pixels_per_point);
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
