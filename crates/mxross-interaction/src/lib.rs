@@ -47,7 +47,10 @@ struct PendingStart {
 pub struct CanvasController {
     camera: OrbitCamera,
     brush_engine: BrushEngine,
-    canvas_half_size: f32,
+    /// (half_width, half_height) — not necessarily equal; see
+    /// `mxross-render-gpu`'s `half_extents_for` for how a non-square
+    /// canvas shapes this.
+    canvas_half_extents: (f32, f32),
     screen_size: (f32, f32),
     last_pointer: Option<(f32, f32)>,
     last_pinch_distance: Option<f32>,
@@ -59,11 +62,19 @@ pub struct CanvasController {
 }
 
 impl CanvasController {
-    pub fn new(canvas_half_size: f32, canvas_texture_size_px: f32, screen_size: (f32, f32)) -> Self {
+    /// `canvas_half_extents`/`canvas_texture_size_px` are both
+    /// `(width, height)` — not assumed square, so a non-square canvas
+    /// (e.g. a 1920x1080 "New Canvas" choice) maps touches and spaces
+    /// dabs correctly on each axis independently.
+    pub fn new(
+        canvas_half_extents: (f32, f32),
+        canvas_texture_size_px: (f32, f32),
+        screen_size: (f32, f32),
+    ) -> Self {
         Self {
             camera: OrbitCamera::new(),
             brush_engine: BrushEngine::new(BrushPreset::default_ink(), canvas_texture_size_px),
-            canvas_half_size,
+            canvas_half_extents,
             screen_size,
             last_pointer: None,
             last_pinch_distance: None,
@@ -121,8 +132,9 @@ impl CanvasController {
         let world_x = ndc_x * half_width + pan_x;
         let world_y = ndc_y * half_height + pan_y;
 
-        let u = (world_x / self.canvas_half_size + 1.0) / 2.0;
-        let v = (1.0 - world_y / self.canvas_half_size) / 2.0;
+        let (half_width, half_height) = self.canvas_half_extents;
+        let u = (world_x / half_width + 1.0) / 2.0;
+        let v = (1.0 - world_y / half_height) / 2.0;
         (u, v)
     }
 
@@ -314,4 +326,4 @@ impl CanvasController {
         self.pending_start = None;
         plans
     }
-                     }
+            }
