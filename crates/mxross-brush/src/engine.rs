@@ -5,12 +5,16 @@
 //! whatever `DabPlan`s come out of it and has no brush logic of its own.
 //!
 //! Distance math (for spacing) happens in `canvas_size_px` units — a
-//! plain dimension passed in at construction, not a wgpu type. That's
-//! what keeps this crate free of any rendering-API knowledge while still
-//! getting "spacing" to mean the same thing it means in Krita/Photoshop
-//! (a fraction of brush radius, in real pixels) rather than an abstract
-//! fraction of the 0..1 UV space, which wouldn't track brush size
-//! correctly as the canvas resolution changes.
+//! plain `(width, height)` dimension passed in at construction, not a
+//! wgpu type. That's what keeps this crate free of any rendering-API
+//! knowledge while still getting "spacing" to mean the same thing it
+//! means in Krita/Photoshop (a fraction of brush radius, in real
+//! pixels) rather than an abstract fraction of the 0..1 UV space, which
+//! wouldn't track brush size correctly as the canvas resolution
+//! changes. Width and height are tracked separately (not one square
+//! dimension) so spacing distance stays correct on non-square canvases
+//! — the same UV-space delta covers a different real-pixel distance on
+//! each axis once width != height.
 
 use std::time::Instant;
 
@@ -28,14 +32,18 @@ pub struct BrushEngine {
     preset: BrushPreset,
     hook: Box<dyn BrushHook>,
     smoother: StrokeSmoother,
-    canvas_size_px: f32,
+    // (width_px, height_px) — separate per axis so a non-square canvas
+    // doesn't distort spacing distance (a UV delta of the same fraction
+    // means a different real-pixel distance on each axis when width !=
+    // height).
+    canvas_size_px: (f32, f32),
     last_stamp: Option<(f32, f32)>,
     dab_index: u32,
     stroke_start: Option<Instant>,
 }
 
 impl BrushEngine {
-    pub fn new(preset: BrushPreset, canvas_size_px: f32) -> Self {
+    pub fn new(preset: BrushPreset, canvas_size_px: (f32, f32)) -> Self {
         Self {
             preset,
             hook: Box::new(NoOpHook),
@@ -116,8 +124,8 @@ impl BrushEngine {
         let spacing_px = (self.preset.radius_px * self.preset.spacing).max(1.0);
         let mut plans = Vec::new();
         loop {
-            let dx = (target.0 - cursor.0) * self.canvas_size_px;
-            let dy = (target.1 - cursor.1) * self.canvas_size_px;
+            let dx = (target.0 - cursor.0) * self.canvas_size_px.0;
+            let dy = (target.1 - cursor.1) * self.canvas_size_px.1;
             let dist = (dx * dx + dy * dy).sqrt();
             if dist < spacing_px {
                 self.last_stamp = Some(cursor);
@@ -154,4 +162,4 @@ impl BrushEngine {
         }));
         plans
     }
-}
+    }
