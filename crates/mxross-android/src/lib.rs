@@ -63,7 +63,7 @@ fn android_main(app: AndroidApp) {
     // Carries the painting across a TerminateWindow/InitWindow rebuild —
     // see GpuState::snapshot_canvas's doc comment for why this can't
     // just live inside GpuState itself.
-    let mut canvas_snapshot: Option<Vec<u8>> = None;
+    let mut canvas_snapshot: Option<(u32, u32, Vec<u8>)> = None;
 
     loop {
         app.poll_events(Some(Duration::from_millis(16)), |event| {
@@ -72,8 +72,8 @@ fn android_main(app: AndroidApp) {
                     if let Some(window) = app.native_window() {
                         match GpuState::new(window) {
                             Ok(mut state) => {
-                                if let Some(pixels) = canvas_snapshot.take() {
-                                    state.restore_canvas(&pixels);
+                                if let Some((width, height, pixels)) = canvas_snapshot.take() {
+                                    state.restore_canvas(width, height, &pixels);
                                 }
                                 gpu = Some(state);
                             }
@@ -83,7 +83,7 @@ fn android_main(app: AndroidApp) {
                 }
                 PollEvent::Main(MainEvent::TerminateWindow { .. }) => {
                     if let Some(state) = gpu.take() {
-                        canvas_snapshot = Some(state.snapshot_canvas());
+                        canvas_snapshot = state.snapshot_canvas();
                     }
                 }
                 PollEvent::Main(MainEvent::WindowResized { .. }) => {
@@ -143,4 +143,4 @@ fn android_main(app: AndroidApp) {
             }
         }
     }
-        }
+    }
