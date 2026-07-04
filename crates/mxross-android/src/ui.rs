@@ -32,7 +32,25 @@ pub struct AppUi {
     /// no auto-clear timer, simplest thing that gives a real answer.
     last_export_status: Option<String>,
     start: Instant,
+    /// Currently-typed custom width/height on the "New Canvas" setup
+    /// screen — persists across frames the way a text field naturally
+    /// would, unlike the take-and-clear request flags above which are
+    /// one-shot events rather than ongoing state.
+    setup_width: u32,
+    setup_height: u32,
 }
+
+/// (label, width, height) shown as one-tap buttons on the setup screen.
+/// A mix of square and common non-square sizes, since "custom" already
+/// covers everything else — these are just the sizes worth one tap
+/// instead of two DragValue drags.
+const CANVAS_PRESETS: &[(&str, u32, u32)] = &[
+    ("Square — 1024", 1024, 1024),
+    ("Square — 2048", 2048, 2048),
+    ("Square — 4096", 4096, 4096),
+    ("Landscape — 1920 x 1080", 1920, 1080),
+    ("Portrait — 1080 x 1920", 1080, 1920),
+];
 
 impl AppUi {
     pub fn new() -> Self {
@@ -45,6 +63,8 @@ impl AppUi {
             export_requested: false,
             last_export_status: None,
             start: Instant::now(),
+            setup_width: 1024,
+            setup_height: 1024,
         }
     }
 
@@ -77,6 +97,88 @@ impl AppUi {
     /// either succeeded or failed.
     pub fn set_export_status(&mut self, status: String) {
         self.last_export_status = Some(status);
+    }
+
+    /// The entry screen shown before any canvas exists — presets plus a
+    /// custom width/height, gated to `[64, max_dimension]` so a typed-in
+    /// value can't exceed what this GPU can actually allocate (see
+    /// `GpuState::max_texture_dimension`). Returns the chosen
+    /// `(width, height)` the frame a preset or "Create Custom Canvas"
+    /// gets tapped, `None` every other frame.
+    pub fn run_setup_frame(
+        &mut self,
+        max_dimension: u32,
+        events: Vec<egui::Event>,
+        screen_size_px: (u32, u32),
+        pixels_per_point: f32,
+    ) -> (egui::FullOutput, Option<(u32, u32)>) {
+        self.ctx.set_pixels_per_point(pixels_per_point);
+
+        let screen_size_points = egui::vec2(
+            screen_size_px.0 as f32 / pixels_per_point,
+            screen_size_px.1 as f32 / pixels_per_point,
+        );
+
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen_size_points)),
+            time: Some(self.start.elapsed().as_secs_f64()),
+            events,
+            ..Default::default()
+        };
+
+        let min_dimension = 64_u32.min(max_dimension);
+        let mut chosen = None;
+        // Rough-centered rather than perfectly centered (no measured
+        // panel size available up front) — good enough for a one-off
+        // entry screen; `set_width` below at least keeps its own layout
+        // consistent regardless of position.
+        let panel_pos = egui::pos2(
+            (screen_size_points.x / 2.0 - 150.0).max(16.0),
+            (screen_size_points.y / 2.0 - 190.0).max(16.0),
+        );
+
+        let output = self.ctx.run_ui(raw_input, |ui| {
+            egui::Area::new(egui::Id::new("new_canvas_setup"))
+                .fixed_pos(panel_pos)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_black_alpha(230))
+                        .corner_radius(8.0)
+                        .inner_margin(16.0)
+                        .show(ui, |ui| {
+                            ui.set_width(300.0);
+                            ui.heading("New Canvas");
+                            ui.separator();
+                            ui.label("Presets");
+                            for (label, width, height) in CANVAS_PRESETS {
+                                if ui.button(*label).clicked() {
+                                    chosen = Some((*width, *height));
+                                }
+                            }
+                            ui.separator();
+                            ui.label("Custom size (px)");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.setup_width)
+                                        .range(min_dimension..=max_dimension)
+                                        .suffix(" w"),
+                                );
+                                ui.label("×");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.setup_height)
+                                        .range(min_dimension..=max_dimension)
+                                        .suffix(" h"),
+                                );
+                            });
+                            if ui.button("Create Custom Canvas").clicked() {
+                                chosen = Some((self.setup_width, self.setup_height));
+                            }
+                        });
+                });
+        });
+
+        self.pointer_over_ui = self.ctx.egui_wants_pointer_input();
+        (output, chosen)
     }
 
     pub fn run_frame(
@@ -253,4 +355,4 @@ impl Default for AppUi {
     fn default() -> Self {
         Self::new()
     }
-    }
+            }
