@@ -1,13 +1,25 @@
 // crates/mxross-android/src/gpu.rs
 //! wgpu GPU render path for MxRoss Canvas on Android — Instance -> Surface
 //! -> Adapter -> Device -> Queue, then one depth-tested render pass per
-//! frame drawing the paint canvas (mxross-render-gpu), with all pointer
-//! routing (orbit/zoom/paint) handled by mxross-interaction's
-//! `CanvasController`, and the egui UI (ui.rs) drawn flat on top.
+//! frame drawing either the "New Canvas" setup screen or the paint
+//! canvas (mxross-render-gpu), with all pointer routing (orbit/zoom/
+//! paint) handled by mxross-interaction's `CanvasController`, and the
+//! egui UI (ui.rs) drawn flat on top either way.
 //!
 //! This is the one file allowed to know about `mxross-brush` (for
 //! `DabPlan`), `mxross-render-gpu` (for `Dab`/`BackgroundMode`), and
 //! `mxross-export` (for PNG encoding) all at once — that's deliberate.
+//!
+//! ## Screen state machine
+//!
+//! The app boots into `Screen::Setup` — no `PaintCanvas` exists yet, only
+//! the device/surface/depth target. The "New Canvas" screen (ui.rs's
+//! `run_setup_frame`) is the entry interface: pick a preset or a custom
+//! width/height, and `PaintCanvas`/`CanvasController` get constructed
+//! for the very first time right there, transitioning into
+//! `Screen::Painting`. There's deliberately no way back to `Screen::Setup`
+//! yet — see the note in the chat response this shipped with for why
+//! that's scoped out rather than half-built.
 //!
 //! ## The HasDisplayHandle gap
 //!
@@ -41,13 +53,11 @@ use crate::ui::AppUi;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// Which GPU stamp pipeline `apply_dabs` routes dabs through. Lives here
-/// rather than in `mxross-brush` or `mxross-interaction` because nothing
-/// about a stroke's shape, smoothing, or spacing changes between paint
-/// and erase — only which blend state paints it onto the canvas
-/// texture, and that decision already belongs exclusively to this file
-/// (see the crate-level doc comment on `apply_dabs` below). Both tools
-/// share the same `BrushPreset` (radius/spacing), so the brush-size
+/// Which GPU stamp pipeline dabs route through. Lives here rather than
+/// in `mxross-brush` or `mxross-interaction` because nothing about a
+/// stroke's shape, smoothing, or spacing changes between paint and erase
+/// — only which blend state paints it onto the canvas texture. Both
+/// tools share the same `BrushPreset` (radius/spacing), so the brush-size
 /// slider affects whichever tool is currently selected.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Tool {
@@ -87,16 +97,36 @@ impl HasDisplayHandle for WindowHandles {
     }
 }
 
+/// Everything that only exists once a canvas size has actually been
+/// chosen. Absent in `Screen::Setup` — there's nothing to paint on, no
+/// tool, no background mode, until "New Canvas" is confirmed.
+struct PaintingState {
+    canvas: PaintCanvas,
+    controller: CanvasController,
+    background_mode: BackgroundMode,
+    tool: Tool,
+}
+
+enum Screen {
+    /// The entry screen: presets + custom width/height, gating
+    /// everything else until a size is chosen. Carries no payload of its
+    /// own — the actual typed-in width/height live in `AppUi` alongside
+    /// its other one-shot widget state.
+    Setup,
+    Painting(PaintingState),
+}
+
 pub struct GpuState {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
-    canvas: PaintCanvas,
-    controller: CanvasController,
-    background_mode: BackgroundMode,
-    tool: Tool,
+    /// Queried once at device creation (`device.limits().max_texture_dimension_2d`)
+    /// and handed to the setup screen so its custom width/height inputs
+    /// can't be dragged past what this GPU can actually allocate.
+    max_texture_dimension: u32,
+    screen: Screen,
     ui: AppUi,
     egui_renderer: egui_wgpu::Renderer,
     pending_ui_events: Vec<egui::Event>,
@@ -146,18 +176,14 @@ impl GpuState {
             .await
             .map_err(|e| format!("failed to request GPU device: {e}"))?;
 
+        let max_texture_dimension = device.limits().max_texture_dimension_2d;
+
         let config = surface
             .get_default_config(&adapter, width, height)
             .ok_or_else(|| "surface is not supported by this adapter".to_string())?;
         surface.configure(&device, &config);
 
         let depth_view = Self::create_depth_view(&device, width, height);
-        let canvas = PaintCanvas::new(&device, &queue, config.format, DEPTH_FORMAT);
-        let controller = CanvasController::new(
-            canvas.half_size(),
-            canvas.texture_size_px(),
-            (width as f32, height as f32),
-        );
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,
             config.format,
@@ -173,10 +199,8 @@ impl GpuState {
             queue,
             config,
             depth_view,
-            canvas,
-            controller,
-            background_mode: BackgroundMode::Transparent,
-            tool: Tool::Paint,
+            max_texture_dimension,
+            screen: Screen::Setup,
             ui: AppUi::new(),
             egui_renderer,
             pending_ui_events: Vec::new(),
@@ -206,34 +230,67 @@ impl GpuState {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.depth_view = Self::create_depth_view(&self.device, width, height);
-        self.controller.resize(width as f32, height as f32);
+        if let Screen::Painting(state) = &mut self.screen {
+            state.controller.resize(width as f32, height as f32);
+        }
     }
 
-    /// Reads the canvas back to CPU-side pixels — called right before
-    /// this whole `GpuState` (including the GPU texture holding the
-    /// painting) is dropped on `TerminateWindow`. Android backgrounding
-    /// tears down the native window, and this app's response to that is
-    /// to fully tear down and later rebuild the wgpu Device/Surface/
-    /// canvas from scratch (see lib.rs) rather than try to keep a GPU
-    /// context alive across it — safe, but it means the painting itself
-    /// needs to survive that boundary by some other route. This is that
-    /// route: lib.rs holds onto the returned pixels outside `GpuState`
-    /// and hands them to `restore_canvas` once the next `GpuState::new`
-    /// succeeds. Without this, every backgrounding/minimize silently
-    /// wiped the painting.
-    pub fn snapshot_canvas(&self) -> Vec<u8> {
-        let (_, _, pixels) = self.canvas.read_pixels(&self.device, &self.queue);
-        pixels
+    /// Reads the canvas back to CPU-side pixels plus its resolution —
+    /// called right before this whole `GpuState` (including the GPU
+    /// texture holding the painting) is dropped on `TerminateWindow`.
+    /// Android backgrounding tears down the native window, and this
+    /// app's response to that is to fully tear down and later rebuild
+    /// the wgpu Device/Surface/canvas from scratch (see lib.rs) rather
+    /// than try to keep a GPU context alive across it — safe, but it
+    /// means the painting itself needs to survive that boundary by some
+    /// other route. This is that route: lib.rs holds onto the returned
+    /// `(width, height, pixels)` outside `GpuState` and hands it to
+    /// `restore_canvas` once the next `GpuState::new` succeeds.
+    ///
+    /// Returns `None` if backgrounding happened while still on the Setup
+    /// screen — nothing painted yet, nothing to lose, so the app just
+    /// resumes back into Setup.
+    pub fn snapshot_canvas(&self) -> Option<(u32, u32, Vec<u8>)> {
+        match &self.screen {
+            Screen::Painting(state) => {
+                let (width, height, pixels) = state.canvas.read_pixels(&self.device, &self.queue);
+                Some((width, height, pixels))
+            }
+            Screen::Setup => None,
+        }
     }
 
-    /// Restores a snapshot from `snapshot_canvas` into a freshly created
-    /// canvas. No-op if the pixel count doesn't match this canvas's
-    /// resolution (see `PaintCanvas::write_pixels`).
-    pub fn restore_canvas(&mut self, pixels: &[u8]) {
-        self.canvas.write_pixels(&self.queue, pixels);
+    /// Rebuilds a `Screen::Painting` at the given resolution and uploads
+    /// a snapshot from `snapshot_canvas` straight into it — skips
+    /// re-showing the Setup screen after a resume, going right back to
+    /// where painting left off. Note this does NOT restore
+    /// background/tool/brush state (that lived on the dropped
+    /// `PaintingState`, not in the snapshot) — a known, minor gap, not a
+    /// silent one.
+    pub fn restore_canvas(&mut self, width: u32, height: u32, pixels: &[u8]) {
+        let canvas = PaintCanvas::new(&self.device, &self.queue, self.config.format, DEPTH_FORMAT, width, height);
+        canvas.write_pixels(&self.queue, pixels);
+        let controller = CanvasController::new(
+            canvas.half_extents(),
+            canvas.texture_size_px(),
+            (self.config.width as f32, self.config.height as f32),
+        );
+        self.screen = Screen::Painting(PaintingState {
+            canvas,
+            controller,
+            background_mode: BackgroundMode::Transparent,
+            tool: Tool::Paint,
+        });
     }
 
-    fn apply_dabs(&self, plans: Vec<DabPlan>) {
+    /// Free-standing on purpose (no `&self`) — the `Screen::Painting`
+    /// match arm in `render`/`touch_*` already holds a mutable borrow of
+    /// `self.screen`, so a helper that took `&self`/`&mut self` as a
+    /// whole would conflict with it. Taking each piece explicitly keeps
+    /// this a plain data operation the borrow checker has no objection
+    /// to, called as `Self::apply_dabs(&self.device, &self.queue,
+    /// &state.canvas, state.tool, plans)`.
+    fn apply_dabs(device: &wgpu::Device, queue: &wgpu::Queue, canvas: &PaintCanvas, tool: Tool, plans: Vec<DabPlan>) {
         if plans.is_empty() {
             return;
         }
@@ -241,9 +298,9 @@ impl GpuState {
             .into_iter()
             .map(|p| Dab { position: p.position, radius_px: p.radius_px, color: p.color })
             .collect();
-        match self.tool {
-            Tool::Paint => self.canvas.stamp_many(&self.device, &self.queue, &dabs),
-            Tool::Erase => self.canvas.erase_many(&self.device, &self.queue, &dabs),
+        match tool {
+            Tool::Paint => canvas.stamp_many(device, queue, &dabs),
+            Tool::Erase => canvas.erase_many(device, queue, &dabs),
         }
     }
 
@@ -254,12 +311,16 @@ impl GpuState {
             pressed: true,
             modifiers: egui::Modifiers::NONE,
         });
-        let plans = self.controller.pointer_down(x, y, self.ui.pointer_over_ui());
-        self.apply_dabs(plans);
+        if let Screen::Painting(state) = &mut self.screen {
+            let plans = state.controller.pointer_down(x, y, self.ui.pointer_over_ui());
+            Self::apply_dabs(&self.device, &self.queue, &state.canvas, state.tool, plans);
+        }
     }
 
     pub fn second_touch_down(&mut self) {
-        self.controller.second_pointer_down();
+        if let Screen::Painting(state) = &mut self.screen {
+            state.controller.second_pointer_down();
+        }
     }
 
     pub fn touch_move(&mut self, pointers: &[(f32, f32)], pixels_per_point: f32) {
@@ -269,8 +330,10 @@ impl GpuState {
                 y / pixels_per_point,
             )));
         }
-        let plans = self.controller.pointer_moved(pointers, self.ui.pointer_over_ui());
-        self.apply_dabs(plans);
+        if let Screen::Painting(state) = &mut self.screen {
+            let plans = state.controller.pointer_moved(pointers, self.ui.pointer_over_ui());
+            Self::apply_dabs(&self.device, &self.queue, &state.canvas, state.tool, plans);
+        }
     }
 
     pub fn touch_up(&mut self, x: f32, y: f32, pixels_per_point: f32) {
@@ -281,13 +344,15 @@ impl GpuState {
             modifiers: egui::Modifiers::NONE,
         });
         self.pending_ui_events.push(egui::Event::PointerGone);
-        let plans = self.controller.pointer_up(x, y);
-        self.apply_dabs(plans);
+        if let Screen::Painting(state) = &mut self.screen {
+            let plans = state.controller.pointer_up(x, y);
+            Self::apply_dabs(&self.device, &self.queue, &state.canvas, state.tool, plans);
+        }
     }
 
-    fn export_png(&self) -> Result<Vec<u8>, String> {
-        let (width, height, rgba) = self.canvas.read_pixels(&self.device, &self.queue);
-        let pixels = match self.background_mode {
+    fn export_png(device: &wgpu::Device, queue: &wgpu::Queue, canvas: &PaintCanvas, background_mode: BackgroundMode) -> Result<Vec<u8>, String> {
+        let (width, height, rgba) = canvas.read_pixels(device, queue);
+        let pixels = match background_mode {
             BackgroundMode::Transparent => rgba,
             BackgroundMode::Solid([r, g, b]) => {
                 let bg = [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8];
@@ -309,56 +374,108 @@ impl GpuState {
     }
 
     pub fn render(&mut self, clear_color: wgpu::Color, pixels_per_point: f32) {
-        // Commits any touch-start that's cleared the pinch-disambiguation
-        // window since the last frame — see CanvasController::tick's doc
-        // comment. Done before anything else so a freshly-committed dab
-        // still shows up in THIS frame's draw, not the next one.
-        let tick_dabs = self.controller.tick();
-        self.apply_dabs(tick_dabs);
-        let aspect = self.config.width as f32 / self.config.height as f32;
-        self.canvas.set_camera(&self.queue, self.controller.camera().view_proj(aspect));
-
         let events = std::mem::take(&mut self.pending_ui_events);
-        // Read before the mutable camera borrow below — brush_preset()
-        // and camera_mut() both borrow self.controller, and only one
-        // mutable borrow of it can be alive at a time.
-        let current_radius = self.controller.brush_preset().radius_px;
-        let output = self.ui.run_frame(
-            self.controller.camera_mut(),
-            self.background_mode,
-            self.tool,
-            current_radius,
-            events,
-            (self.config.width, self.config.height),
-            pixels_per_point,
-        );
+        let screen_size_px = (self.config.width, self.config.height);
 
-        if self.ui.take_background_toggle_requested() {
-            self.background_mode = match self.background_mode {
-                BackgroundMode::Transparent => BackgroundMode::white(),
-                BackgroundMode::Solid(_) => BackgroundMode::Transparent,
-            };
-            self.canvas.set_background_mode(&self.queue, self.background_mode);
-        }
+        // Set only by the Setup arm below, and only acted on AFTER the
+        // match ends — reassigning self.screen from inside an arm that's
+        // itself matching on &mut self.screen doesn't borrow-check, so
+        // the transition has to happen as a separate step once the
+        // match's borrow of self.screen has ended.
+        let mut new_canvas: Option<(u32, u32)> = None;
 
-        if self.ui.take_tool_toggle_requested() {
-            self.tool = self.tool.toggled();
-        }
-
-        if let Some(radius) = self.ui.take_brush_radius_change() {
-            self.controller.brush_preset_mut().radius_px = radius;
-        }
-
-        if self.ui.take_export_request() {
-            match self.export_png() {
-                Ok(bytes) => self.pending_export = Some(bytes),
-                Err(e) => {
-                    log::error!("PNG export failed: {e}");
-                    self.ui.set_export_status(format!("Export failed: {e}"));
-                }
+        let output = match &mut self.screen {
+            Screen::Setup => {
+                let (output, chosen) = self.ui.run_setup_frame(
+                    self.max_texture_dimension,
+                    events,
+                    screen_size_px,
+                    pixels_per_point,
+                );
+                new_canvas = chosen;
+                output
             }
+            Screen::Painting(state) => {
+                // Commits any touch-start that's cleared the pinch-
+                // disambiguation window since the last frame — see
+                // CanvasController::tick's doc comment. Done before
+                // anything else so a freshly-committed dab still shows
+                // up in THIS frame's draw, not the next one.
+                let tick_dabs = state.controller.tick();
+                Self::apply_dabs(&self.device, &self.queue, &state.canvas, state.tool, tick_dabs);
+
+                let aspect = self.config.width as f32 / self.config.height as f32;
+                state.canvas.set_camera(&self.queue, state.controller.camera().view_proj(aspect));
+
+                // Read before the mutable camera borrow below —
+                // brush_preset() and camera_mut() both borrow
+                // state.controller, and only one mutable borrow of it
+                // can be alive at a time.
+                let current_radius = state.controller.brush_preset().radius_px;
+                let output = self.ui.run_frame(
+                    state.controller.camera_mut(),
+                    state.background_mode,
+                    state.tool,
+                    current_radius,
+                    events,
+                    screen_size_px,
+                    pixels_per_point,
+                );
+
+                if self.ui.take_background_toggle_requested() {
+                    state.background_mode = match state.background_mode {
+                        BackgroundMode::Transparent => BackgroundMode::white(),
+                        BackgroundMode::Solid(_) => BackgroundMode::Transparent,
+                    };
+                    state.canvas.set_background_mode(&self.queue, state.background_mode);
+                }
+
+                if self.ui.take_tool_toggle_requested() {
+                    state.tool = state.tool.toggled();
+                }
+
+                if let Some(radius) = self.ui.take_brush_radius_change() {
+                    state.controller.brush_preset_mut().radius_px = radius;
+                }
+
+                if self.ui.take_export_request() {
+                    match Self::export_png(&self.device, &self.queue, &state.canvas, state.background_mode) {
+                        Ok(bytes) => self.pending_export = Some(bytes),
+                        Err(e) => {
+                            log::error!("PNG export failed: {e}");
+                            self.ui.set_export_status(format!("Export failed: {e}"));
+                        }
+                    }
+                }
+
+                output
+            }
+        };
+
+        if let Some((width, height)) = new_canvas {
+            let width = width.clamp(64, self.max_texture_dimension);
+            let height = height.clamp(64, self.max_texture_dimension);
+            let canvas = PaintCanvas::new(&self.device, &self.queue, self.config.format, DEPTH_FORMAT, width, height);
+            let controller = CanvasController::new(
+                canvas.half_extents(),
+                canvas.texture_size_px(),
+                (self.config.width as f32, self.config.height as f32),
+            );
+            self.screen = Screen::Painting(PaintingState {
+                canvas,
+                controller,
+                background_mode: BackgroundMode::Transparent,
+                tool: Tool::Paint,
+            });
         }
 
+        self.present(output, pixels_per_point);
+    }
+
+    /// Shared by both screens — a `Screen::Setup` frame has no canvas to
+    /// draw, but still needs the same surface-acquire/egui-render/submit
+    /// machinery as a `Screen::Painting` one.
+    fn present(&mut self, output: egui::FullOutput, pixels_per_point: f32) {
         let paint_jobs = self.ui.ctx().tessellate(output.shapes, output.pixels_per_point);
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
@@ -422,7 +539,9 @@ impl GpuState {
                 multiview_mask: None,
             });
 
-            self.canvas.draw(&mut pass);
+            if let Screen::Painting(state) = &self.screen {
+                state.canvas.draw(&mut pass);
+            }
 
             let mut pass = pass.forget_lifetime();
             self.egui_renderer.render(&mut pass, &paint_jobs, &screen_descriptor);
@@ -435,4 +554,4 @@ impl GpuState {
             self.egui_renderer.free_texture(id);
         }
     }
-    }
+}
