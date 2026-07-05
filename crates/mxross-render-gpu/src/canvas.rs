@@ -133,6 +133,7 @@ pub struct PaintCanvas {
     height_px: u32,
     half_width: f32,
     half_height: f32,
+    pixel_art: bool,
     display_pipeline: wgpu::RenderPipeline,
     display_vertex_buffer: wgpu::Buffer,
     display_index_buffer: wgpu::Buffer,
@@ -146,6 +147,16 @@ pub struct PaintCanvas {
 impl PaintCanvas {
     /// `width_px`/`height_px` need not be square — see `half_extents_for`
     /// for how a non-square resolution shapes the world-space plane.
+    ///
+    /// `pixel_art` is a one-time choice baked in at construction, not a
+    /// runtime toggle: it picks both the display sampler's filter mode
+    /// (Nearest, so magnified pixels stay crisp squares instead of
+    /// blending) and which stamp shader gets compiled in (hard-edged
+    /// `canvas_stamp_pixel.wgsl` vs the default soft
+    /// `canvas_stamp.wgsl`). Both live on the GPU pipeline/sampler
+    /// objects themselves, which is why this can't be flipped after the
+    /// fact without rebuilding the canvas — same as picking a canvas
+    /// resolution.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -153,6 +164,7 @@ impl PaintCanvas {
         depth_format: wgpu::TextureFormat,
         width_px: u32,
         height_px: u32,
+        pixel_art: bool,
     ) -> Self {
         let (half_width, half_height) = half_extents_for(width_px, height_px);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -195,13 +207,19 @@ impl PaintCanvas {
         }
         queue.submit(std::iter::once(clear_encoder.finish()));
 
+        // Nearest for pixel art: magnifying the canvas while zoomed in
+        // shows actual pixel squares instead of the GPU blending
+        // neighboring texels together. Linear (the previous, only,
+        // behavior) is what a painting canvas normally wants — smooth
+        // brush edges stay smooth when you zoom in on them.
+        let filter_mode = if pixel_art { wgpu::FilterMode::Nearest } else { wgpu::FilterMode::Linear };
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("paint canvas sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: filter_mode,
+            min_filter: filter_mode,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
@@ -351,9 +369,14 @@ impl PaintCanvas {
             usage: wgpu::BufferUsages::INDEX,
         });
 
+        let stamp_shader_source = if pixel_art {
+            include_str!("shaders/canvas_stamp_pixel.wgsl")
+        } else {
+            include_str!("shaders/canvas_stamp.wgsl")
+        };
         let stamp_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("paint canvas stamp shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/canvas_stamp.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(stamp_shader_source.into()),
         });
 
         let stamp_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -387,6 +410,7 @@ impl PaintCanvas {
             height_px,
             half_width,
             half_height,
+            pixel_art,
             display_pipeline,
             display_vertex_buffer,
             display_index_buffer,
@@ -477,6 +501,14 @@ impl PaintCanvas {
     /// works in real pixels. Not necessarily square.
     pub fn texture_size_px(&self) -> (f32, f32) {
         (self.width_px as f32, self.height_px as f32)
+    }
+
+    /// Whether this canvas was created in pixel-art mode — read back by
+    /// `GpuState::snapshot_canvas` so a background/resume rebuilds the
+    /// canvas with the same sampler/stamp-shader choice rather than
+    /// silently reverting to smooth mode.
+    pub fn is_pixel_art(&self) -> bool {
+        self.pixel_art
     }
 
     /// Stamps every dab in `dabs` in one render pass — one encoder, one
@@ -674,4 +706,4 @@ impl PaintCanvas {
             wgpu::Extent3d { width: self.width_px, height: self.height_px, depth_or_array_layers: 1 },
         );
     }
-        }
+  }
