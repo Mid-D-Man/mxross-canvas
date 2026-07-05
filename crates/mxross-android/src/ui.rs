@@ -38,6 +38,7 @@ pub struct AppUi {
     /// one-shot events rather than ongoing state.
     setup_width: u32,
     setup_height: u32,
+    setup_pixel_art: bool,
 }
 
 /// (label, width, height) shown as one-tap buttons on the setup screen.
@@ -65,6 +66,7 @@ impl AppUi {
             start: Instant::now(),
             setup_width: 1024,
             setup_height: 1024,
+            setup_pixel_art: false,
         }
     }
 
@@ -103,15 +105,18 @@ impl AppUi {
     /// custom width/height, gated to `[64, max_dimension]` so a typed-in
     /// value can't exceed what this GPU can actually allocate (see
     /// `GpuState::max_texture_dimension`). Returns the chosen
-    /// `(width, height)` the frame a preset or "Create Custom Canvas"
-    /// gets tapped, `None` every other frame.
+    /// `(width, height, pixel_art)` the frame a preset or "Create Custom
+    /// Canvas" gets tapped, `None` every other frame. The pixel-art
+    /// checkbox applies to whichever is chosen — presets included, not
+    /// just custom sizes, since there's no reason a preset-sized canvas
+    /// shouldn't also get hard edges.
     pub fn run_setup_frame(
         &mut self,
         max_dimension: u32,
         events: Vec<egui::Event>,
         screen_size_px: (u32, u32),
         pixels_per_point: f32,
-    ) -> (egui::FullOutput, Option<(u32, u32)>) {
+    ) -> (egui::FullOutput, Option<(u32, u32, bool)>) {
         self.ctx.set_pixels_per_point(pixels_per_point);
 
         let screen_size_points = egui::vec2(
@@ -149,10 +154,12 @@ impl AppUi {
                             ui.set_width(300.0);
                             ui.heading("New Canvas");
                             ui.separator();
+                            ui.checkbox(&mut self.setup_pixel_art, "Pixel art mode (hard edges, no smoothing)");
+                            ui.separator();
                             ui.label("Presets");
                             for (label, width, height) in CANVAS_PRESETS {
                                 if ui.button(*label).clicked() {
-                                    chosen = Some((*width, *height));
+                                    chosen = Some((*width, *height, self.setup_pixel_art));
                                 }
                             }
                             ui.separator();
@@ -171,7 +178,7 @@ impl AppUi {
                                 );
                             });
                             if ui.button("Create Custom Canvas").clicked() {
-                                chosen = Some((self.setup_width, self.setup_height));
+                                chosen = Some((self.setup_width, self.setup_height, self.setup_pixel_art));
                             }
                         });
                 });
@@ -355,4 +362,4 @@ impl Default for AppUi {
     fn default() -> Self {
         Self::new()
     }
-            }
+        }
