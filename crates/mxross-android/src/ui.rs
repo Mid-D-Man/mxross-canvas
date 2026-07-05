@@ -100,6 +100,8 @@ impl AppUi {
             setup_width: 1024,
             setup_height: 1024,
             setup_pixel_art: false,
+            setup_active_field: None,
+            setup_field_input: String::new(),
         }
     }
 
@@ -447,4 +449,4 @@ impl Default for AppUi {
     fn default() -> Self {
         Self::new()
     }
-}
+        }
