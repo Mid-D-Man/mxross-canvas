@@ -250,25 +250,27 @@ impl GpuState {
     /// Returns `None` if backgrounding happened while still on the Setup
     /// screen — nothing painted yet, nothing to lose, so the app just
     /// resumes back into Setup.
-    pub fn snapshot_canvas(&self) -> Option<(u32, u32, Vec<u8>)> {
+    pub fn snapshot_canvas(&self) -> Option<(u32, u32, bool, Vec<u8>)> {
         match &self.screen {
             Screen::Painting(state) => {
                 let (width, height, pixels) = state.canvas.read_pixels(&self.device, &self.queue);
-                Some((width, height, pixels))
+                Some((width, height, state.canvas.is_pixel_art(), pixels))
             }
             Screen::Setup => None,
         }
     }
 
-    /// Rebuilds a `Screen::Painting` at the given resolution and uploads
-    /// a snapshot from `snapshot_canvas` straight into it — skips
-    /// re-showing the Setup screen after a resume, going right back to
-    /// where painting left off. Note this does NOT restore
-    /// background/tool/brush state (that lived on the dropped
-    /// `PaintingState`, not in the snapshot) — a known, minor gap, not a
+    /// Rebuilds a `Screen::Painting` at the given resolution and pixel-
+    /// art setting, and uploads a snapshot from `snapshot_canvas`
+    /// straight into it — skips re-showing the Setup screen after a
+    /// resume, going right back to where painting left off. `pixel_art`
+    /// survives the round trip since it's read back from the canvas
+    /// itself (see `PaintCanvas::is_pixel_art`), but background mode /
+    /// tool / brush radius don't — those lived on the dropped
+    /// `PaintingState`, not in the snapshot. A known, minor gap, not a
     /// silent one.
-    pub fn restore_canvas(&mut self, width: u32, height: u32, pixels: &[u8]) {
-        let canvas = PaintCanvas::new(&self.device, &self.queue, self.config.format, DEPTH_FORMAT, width, height);
+    pub fn restore_canvas(&mut self, width: u32, height: u32, pixel_art: bool, pixels: &[u8]) {
+        let canvas = PaintCanvas::new(&self.device, &self.queue, self.config.format, DEPTH_FORMAT, width, height, pixel_art);
         canvas.write_pixels(&self.queue, pixels);
         let controller = CanvasController::new(
             canvas.half_extents(),
@@ -382,7 +384,7 @@ impl GpuState {
         // itself matching on &mut self.screen doesn't borrow-check, so
         // the transition has to happen as a separate step once the
         // match's borrow of self.screen has ended.
-        let mut new_canvas: Option<(u32, u32)> = None;
+        let mut new_canvas: Option<(u32, u32, bool)> = None;
 
         let output = match &mut self.screen {
             Screen::Setup => {
@@ -452,10 +454,10 @@ impl GpuState {
             }
         };
 
-        if let Some((width, height)) = new_canvas {
+        if let Some((width, height, pixel_art)) = new_canvas {
             let width = width.clamp(64, self.max_texture_dimension);
             let height = height.clamp(64, self.max_texture_dimension);
-            let canvas = PaintCanvas::new(&self.device, &self.queue, self.config.format, DEPTH_FORMAT, width, height);
+            let canvas = PaintCanvas::new(&self.device, &self.queue, self.config.format, DEPTH_FORMAT, width, height, pixel_art);
             let controller = CanvasController::new(
                 canvas.half_extents(),
                 canvas.texture_size_px(),
@@ -554,4 +556,4 @@ impl GpuState {
             self.egui_renderer.free_texture(id);
         }
     }
-}
+            }
