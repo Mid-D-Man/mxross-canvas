@@ -12,6 +12,15 @@ use mxross_render_gpu::BackgroundMode;
 use crate::gizmo;
 use crate::gpu::Tool;
 
+/// Which custom-size field the on-screen keypad is currently editing —
+/// see `AppUi::setup_active_field`'s doc comment for why there's a
+/// custom keypad here at all instead of a normal text field.
+#[derive(Clone, Copy, PartialEq)]
+enum SetupField {
+    Width,
+    Height,
+}
+
 pub struct AppUi {
     ctx: egui::Context,
     pointer_over_ui: bool,
@@ -32,13 +41,37 @@ pub struct AppUi {
     /// no auto-clear timer, simplest thing that gives a real answer.
     last_export_status: Option<String>,
     start: Instant,
-    /// Currently-typed custom width/height on the "New Canvas" setup
+    /// Currently-committed custom width/height on the "New Canvas" setup
     /// screen — persists across frames the way a text field naturally
     /// would, unlike the take-and-clear request flags above which are
     /// one-shot events rather than ongoing state.
     setup_width: u32,
     setup_height: u32,
     setup_pixel_art: bool,
+    /// Which field (if any) the on-screen keypad below is currently
+    /// editing. `None` means the keypad is hidden and the width/height
+    /// rows just show their committed values.
+    ///
+    /// This exists instead of a plain `egui::TextEdit`/`DragValue`
+    /// because on Android's NativeActivity backend, showing the OS soft
+    /// keyboard from a non-Java view is a real, documented, unresolved
+    /// limitation of the `android-activity` crate (see
+    /// rust-mobile/android-activity#44 and #140) — `AndroidApp::
+    /// show_soft_input()` exists, but `InputMethodManager` refuses to
+    /// show a keyboard for a view that isn't an actual `EditText`, and
+    /// NativeActivity's content view never is one. `game-activity` has
+    /// better keyboard support via GameTextInput, but that backend was
+    /// already ruled out for this project (needs Gradle for its `.aar`,
+    /// which the cargo-apk build pipeline doesn't have). Building a
+    /// keypad entirely in egui sidesteps the OS IME problem completely
+    /// instead of depending on a backend limitation that may never
+    /// resolve.
+    setup_active_field: Option<SetupField>,
+    /// Digits typed so far for whichever field `setup_active_field`
+    /// points at. Committed into `setup_width`/`setup_height` (clamped)
+    /// when "Done" is tapped; discarded if you switch fields without
+    /// hitting "Done" first.
+    setup_field_input: String,
 }
 
 /// (label, width, height) shown as one-tap buttons on the setup screen.
@@ -164,19 +197,71 @@ impl AppUi {
                             }
                             ui.separator();
                             ui.label("Custom size (px)");
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::DragValue::new(&mut self.setup_width)
-                                        .range(min_dimension..=max_dimension)
-                                        .suffix(" w"),
-                                );
-                                ui.label("×");
-                                ui.add(
-                                    egui::DragValue::new(&mut self.setup_height)
-                                        .range(min_dimension..=max_dimension)
-                                        .suffix(" h"),
-                                );
-                            });
+                            let width_active = self.setup_active_field == Some(SetupField::Width);
+                            let width_label = if width_active {
+                                format!("Width: {} (editing)", self.setup_field_input)
+                            } else {
+                                format!("Width: {} px", self.setup_width)
+                            };
+                            if ui.button(width_label).clicked() && !width_active {
+                                self.setup_active_field = Some(SetupField::Width);
+                                self.setup_field_input = self.setup_width.to_string();
+                            }
+
+                            let height_active = self.setup_active_field == Some(SetupField::Height);
+                            let height_label = if height_active {
+                                format!("Height: {} (editing)", self.setup_field_input)
+                            } else {
+                                format!("Height: {} px", self.setup_height)
+                            };
+                            if ui.button(height_label).clicked() && !height_active {
+                                self.setup_active_field = Some(SetupField::Height);
+                                self.setup_field_input = self.setup_height.to_string();
+                            }
+
+                            if let Some(field) = self.setup_active_field {
+                                ui.add_space(8.0);
+                                let rows = [["7", "8", "9"], ["4", "5", "6"], ["1", "2", "3"], ["DEL", "0", "Done"]];
+                                for row in rows {
+                                    ui.horizontal(|ui| {
+                                        for label in row {
+                                            if ui.button(label).clicked() {
+                                                match label {
+                                                    "DEL" => {
+                                                        self.setup_field_input.pop();
+                                                    }
+                                                    "Done" => {
+                                                        let current = match field {
+                                                            SetupField::Width => self.setup_width,
+                                                            SetupField::Height => self.setup_height,
+                                                        };
+                                                        let parsed: u32 =
+                                                            self.setup_field_input.parse().unwrap_or(current);
+                                                        let clamped = parsed.clamp(min_dimension, max_dimension);
+                                                        match field {
+                                                            SetupField::Width => self.setup_width = clamped,
+                                                            SetupField::Height => self.setup_height = clamped,
+                                                        }
+                                                        self.setup_active_field = None;
+                                                    }
+                                                    digit => {
+                                                        // 5 digits covers anything up to 99999px —
+                                                        // comfortably past any real GPU's
+                                                        // max_texture_dimension_2d, so this is just
+                                                        // a sanity cap, not the real clamp (that
+                                                        // happens on "Done" against the actual
+                                                        // device limit).
+                                                        if self.setup_field_input.len() < 5 {
+                                                            self.setup_field_input.push_str(digit);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+
                             if ui.button("Create Custom Canvas").clicked() {
                                 chosen = Some((self.setup_width, self.setup_height, self.setup_pixel_art));
                             }
@@ -362,4 +447,4 @@ impl Default for AppUi {
     fn default() -> Self {
         Self::new()
     }
-        }
+}
