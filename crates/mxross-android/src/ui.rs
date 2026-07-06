@@ -136,6 +136,68 @@ impl AppUi {
         self.last_export_status = Some(status);
     }
 
+    /// The very first screen shown on launch — "New Canvas" is the only
+    /// functional tile right now. Continue/Gallery are shown (matching
+    /// the intended design direction) but disabled, since both need real
+    /// project save/load, which doesn't exist yet — `mxross-document`'s
+    /// `.kriter` format is still an intentional empty stub (container
+    /// shape undecided: single binary vs zip bundle). Showing them
+    /// grayed out is honest about that; hiding them entirely would lose
+    /// the intended layout, and enabling them would be a dead button.
+    /// Returns `true` the frame "New Canvas" gets tapped.
+    pub fn run_home_frame(
+        &mut self,
+        events: Vec<egui::Event>,
+        screen_size_px: (u32, u32),
+        pixels_per_point: f32,
+    ) -> (egui::FullOutput, bool) {
+        self.ctx.set_pixels_per_point(pixels_per_point);
+
+        let screen_size_points = egui::vec2(
+            screen_size_px.0 as f32 / pixels_per_point,
+            screen_size_px.1 as f32 / pixels_per_point,
+        );
+
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen_size_points)),
+            time: Some(self.start.elapsed().as_secs_f64()),
+            events,
+            ..Default::default()
+        };
+
+        let panel_pos = egui::pos2(
+            (screen_size_points.x / 2.0 - 140.0).max(16.0),
+            (screen_size_points.y / 2.0 - 130.0).max(16.0),
+        );
+
+        let mut new_canvas_tapped = false;
+        let output = self.ctx.run_ui(raw_input, |ui| {
+            egui::Area::new(egui::Id::new("home_screen"))
+                .fixed_pos(panel_pos)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_black_alpha(230))
+                        .corner_radius(8.0)
+                        .inner_margin(16.0)
+                        .show(ui, |ui| {
+                            ui.set_width(280.0);
+                            ui.heading("MxRoss Canvas");
+                            ui.separator();
+                            if ui.button("New Canvas").clicked() {
+                                new_canvas_tapped = true;
+                            }
+                            ui.add_space(4.0);
+                            ui.add_enabled(false, egui::Button::new("Continue (coming soon)"));
+                            ui.add_space(4.0);
+                            ui.add_enabled(false, egui::Button::new("Gallery (coming soon)"));
+                        });
+                });
+        });
+
+        self.pointer_over_ui = self.ctx.egui_wants_pointer_input();
+        (output, new_canvas_tapped)
+    }
+
     /// The entry screen shown before any canvas exists — presets plus a
     /// custom width/height, gated to `[64, max_dimension]` so a typed-in
     /// value can't exceed what this GPU can actually allocate (see
@@ -316,99 +378,85 @@ impl AppUi {
         let mut new_radius = None;
 
         let output = self.ctx.run_ui(raw_input, |ui| {
-            egui::Area::new(egui::Id::new("camera_mode_toggle"))
+            // Top bar: camera mode + readout, grouped into one row
+            // instead of two separately-positioned floating labels.
+            egui::Area::new(egui::Id::new("top_status_bar"))
                 .fixed_pos(egui::pos2(16.0, 16.0))
                 .show(ui.ctx(), |ui| {
-                    let label = match mode {
-                        CameraMode::LockedOrtho => "Locked Ortho",
-                        CameraMode::FreeOrbit => "Free Orbit",
-                    };
-                    if ui.button(label).clicked() {
-                        clicked_toggle = true;
-                    }
-                });
-
-            egui::Area::new(egui::Id::new("camera_readout"))
-                .fixed_pos(egui::pos2(16.0, 56.0))
-                .show(ui.ctx(), |ui| {
-                    ui.label(readout.as_str());
-                });
-
-            egui::Area::new(egui::Id::new("background_toggle"))
-                .fixed_pos(egui::pos2(16.0, 96.0))
-                .show(ui.ctx(), |ui| {
-                    if ui.button(background_label).clicked() {
-                        clicked_background = true;
-                    }
-                });
-
-            egui::Area::new(egui::Id::new("export_button"))
-                .fixed_pos(egui::pos2(16.0, 136.0))
-                .show(ui.ctx(), |ui| {
-                    if ui.button("Export PNG").clicked() {
-                        clicked_export = true;
-                    }
-                });
-
-            egui::Area::new(egui::Id::new("focus_canvas"))
-                .fixed_pos(egui::pos2(16.0, 216.0))
-                .show(ui.ctx(), |ui| {
-                    if ui.button("Focus Canvas").clicked() {
-                        clicked_focus = true;
-                    }
-                });
-
-            egui::Area::new(egui::Id::new("tool_toggle"))
-                .fixed_pos(egui::pos2(16.0, 256.0))
-                .show(ui.ctx(), |ui| {
-                    if ui.button(tool.label()).clicked() {
-                        clicked_tool = true;
-                    }
-                });
-
-            egui::Area::new(egui::Id::new("brush_size_slider"))
-                .fixed_pos(egui::pos2(16.0, 296.0))
-                .show(ui.ctx(), |ui| {
-                    // Background panel for the same reason export_status
-                    // gets one — a bare slider is hard to see against a
-                    // busy painted canvas.
                     egui::Frame::default()
                         .fill(egui::Color32::from_black_alpha(180))
                         .corner_radius(4.0)
                         .inner_margin(6.0)
                         .show(ui, |ui| {
-                            let mut radius = brush_radius;
-                            // 2..=64 canvas-texture px (same unit
-                            // BrushPreset::radius_px already uses). 2 is
-                            // small-but-usable at the 1024px canvas
-                            // resolution; 64 is wide enough to matter
-                            // without the slider being mostly dead
-                            // space. Tune by feel on-device.
-                            let response = ui.add(
-                                egui::Slider::new(&mut radius, 2.0..=64.0).text("Brush Size"),
-                            );
-                            if response.changed() {
-                                new_radius = Some(radius);
-                            }
+                            ui.horizontal(|ui| {
+                                let label = match mode {
+                                    CameraMode::LockedOrtho => "Locked Ortho",
+                                    CameraMode::FreeOrbit => "Free Orbit",
+                                };
+                                if ui.button(label).clicked() {
+                                    clicked_toggle = true;
+                                }
+                                ui.separator();
+                                ui.label(readout.as_str());
+                            });
                         });
                 });
 
-            if let Some(status) = &export_status {
-                egui::Area::new(egui::Id::new("export_status"))
-                    .fixed_pos(egui::pos2(16.0, 176.0))
-                    .show(ui.ctx(), |ui| {
-                        // Background panel, not just bare text — a plain
-                        // label here would be invisible against a busy
-                        // painted canvas behind it.
-                        egui::Frame::default()
-                            .fill(egui::Color32::from_black_alpha(180))
-                            .corner_radius(4.0)
-                            .inner_margin(6.0)
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(status).color(egui::Color32::WHITE));
+            // Bottom toolbar: brush size plus the four main actions,
+            // grouped into one bar pinned to the bottom of the screen —
+            // this replaces what used to be four separately-positioned
+            // floating buttons plus a separately-positioned slider, all
+            // stacked down the left edge regardless of screen size.
+            let bar_height = 92.0;
+            let bar_y = (screen_size_points.y - bar_height - 16.0).max(16.0);
+            egui::Area::new(egui::Id::new("bottom_toolbar"))
+                .fixed_pos(egui::pos2(16.0, bar_y))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_black_alpha(200))
+                        .corner_radius(8.0)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.set_width(screen_size_points.x - 32.0);
+
+                            // Diameter, not radius — matches how every
+                            // mainstream painting app (Krita/Photoshop/
+                            // Procreate) labels "brush size", and lets
+                            // the minimum represent an actual 1px-wide
+                            // dab for pixel art precision (radius 0.5 ==
+                            // diameter 1.0), not a 2px-wide one. Nothing
+                            // outside this UI layer changes — BrushPreset
+                            // and everything downstream still works in
+                            // radius_px exactly as before.
+                            let mut diameter = brush_radius * 2.0;
+                            let response =
+                                ui.add(egui::Slider::new(&mut diameter, 1.0..=128.0).text("Brush Size"));
+                            if response.changed() {
+                                new_radius = Some(diameter / 2.0);
+                            }
+
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.button(tool.label()).clicked() {
+                                    clicked_tool = true;
+                                }
+                                if ui.button(background_label).clicked() {
+                                    clicked_background = true;
+                                }
+                                if ui.button("Focus Canvas").clicked() {
+                                    clicked_focus = true;
+                                }
+                                if ui.button("Export PNG").clicked() {
+                                    clicked_export = true;
+                                }
                             });
-                    });
-            }
+
+                            if let Some(status) = &export_status {
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new(status).color(egui::Color32::WHITE));
+                            }
+                        });
+                });
 
             egui::Area::new(egui::Id::new("camera_gizmo"))
                 .fixed_pos(egui::pos2(screen_size_points.x - 136.0, 16.0))
@@ -449,4 +497,4 @@ impl Default for AppUi {
     fn default() -> Self {
         Self::new()
     }
-        }
+    }
