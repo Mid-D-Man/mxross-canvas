@@ -12,12 +12,14 @@
 //!
 //! ## Screen state machine
 //!
-//! The app boots into `Screen::Setup` — no `PaintCanvas` exists yet, only
-//! the device/surface/depth target. The "New Canvas" screen (ui.rs's
-//! `run_setup_frame`) is the entry interface: pick a preset or a custom
-//! width/height, and `PaintCanvas`/`CanvasController` get constructed
-//! for the very first time right there, transitioning into
-//! `Screen::Painting`. There's deliberately no way back to `Screen::Setup`
+//! The app boots into `Screen::Home` — the entry tiles (New Canvas /
+//! Continue / Gallery, the latter two disabled until real project
+//! save/load exists). "New Canvas" moves to `Screen::Setup`: no
+//! `PaintCanvas` exists yet, only the device/surface/depth target. Pick
+//! a preset or a custom width/height there (ui.rs's `run_setup_frame`)
+//! and `PaintCanvas`/`CanvasController` get constructed for the very
+//! first time, transitioning into `Screen::Painting`. There's
+//! deliberately no way back from `Screen::Painting` to an earlier screen
 //! yet — see the note in the chat response this shipped with for why
 //! that's scoped out rather than half-built.
 //!
@@ -108,6 +110,10 @@ struct PaintingState {
 }
 
 enum Screen {
+    /// The very first screen shown on launch — "New Canvas" leads to
+    /// `Screen::Setup`; Continue/Gallery are visible but disabled (see
+    /// `AppUi::run_home_frame`'s doc comment for why).
+    Home,
     /// The entry screen: presets + custom width/height, gating
     /// everything else until a size is chosen. Carries no payload of its
     /// own — the actual typed-in width/height live in `AppUi` alongside
@@ -200,7 +206,7 @@ impl GpuState {
             config,
             depth_view,
             max_texture_dimension,
-            screen: Screen::Setup,
+            screen: Screen::Home,
             ui: AppUi::new(),
             egui_renderer,
             pending_ui_events: Vec::new(),
@@ -256,7 +262,7 @@ impl GpuState {
                 let (width, height, pixels) = state.canvas.read_pixels(&self.device, &self.queue);
                 Some((width, height, state.canvas.is_pixel_art(), pixels))
             }
-            Screen::Setup => None,
+            Screen::Setup | Screen::Home => None,
         }
     }
 
@@ -379,14 +385,27 @@ impl GpuState {
         let events = std::mem::take(&mut self.pending_ui_events);
         let screen_size_px = (self.config.width, self.config.height);
 
-        // Set only by the Setup arm below, and only acted on AFTER the
-        // match ends — reassigning self.screen from inside an arm that's
-        // itself matching on &mut self.screen doesn't borrow-check, so
-        // the transition has to happen as a separate step once the
-        // match's borrow of self.screen has ended.
-        let mut new_canvas: Option<(u32, u32, bool)> = None;
+        // Set only by the Home/Setup arms below, and only acted on AFTER
+        // the match ends — reassigning self.screen from inside an arm
+        // that's itself matching on &mut self.screen doesn't borrow-
+        // check, so the transition has to happen as a separate step once
+        // the match's borrow of self.screen has ended.
+        enum Transition {
+            None,
+            ToSetup,
+            ToPainting(u32, u32, bool),
+        }
+        let mut transition = Transition::None;
 
         let output = match &mut self.screen {
+            Screen::Home => {
+                let (output, new_canvas_tapped) =
+                    self.ui.run_home_frame(events, screen_size_px, pixels_per_point);
+                if new_canvas_tapped {
+                    transition = Transition::ToSetup;
+                }
+                output
+            }
             Screen::Setup => {
                 let (output, chosen) = self.ui.run_setup_frame(
                     self.max_texture_dimension,
@@ -394,7 +413,9 @@ impl GpuState {
                     screen_size_px,
                     pixels_per_point,
                 );
-                new_canvas = chosen;
+                if let Some((width, height, pixel_art)) = chosen {
+                    transition = Transition::ToPainting(width, height, pixel_art);
+                }
                 output
             }
             Screen::Painting(state) => {
@@ -454,21 +475,28 @@ impl GpuState {
             }
         };
 
-        if let Some((width, height, pixel_art)) = new_canvas {
-            let width = width.clamp(64, self.max_texture_dimension);
-            let height = height.clamp(64, self.max_texture_dimension);
-            let canvas = PaintCanvas::new(&self.device, &self.queue, self.config.format, DEPTH_FORMAT, width, height, pixel_art);
-            let controller = CanvasController::new(
-                canvas.half_extents(),
-                canvas.texture_size_px(),
-                (self.config.width as f32, self.config.height as f32),
-            );
-            self.screen = Screen::Painting(PaintingState {
-                canvas,
-                controller,
-                background_mode: BackgroundMode::Transparent,
-                tool: Tool::Paint,
-            });
+        match transition {
+            Transition::None => {}
+            Transition::ToSetup => {
+                self.screen = Screen::Setup;
+            }
+            Transition::ToPainting(width, height, pixel_art) => {
+                let width = width.clamp(64, self.max_texture_dimension);
+                let height = height.clamp(64, self.max_texture_dimension);
+                let canvas =
+                    PaintCanvas::new(&self.device, &self.queue, self.config.format, DEPTH_FORMAT, width, height, pixel_art);
+                let controller = CanvasController::new(
+                    canvas.half_extents(),
+                    canvas.texture_size_px(),
+                    (self.config.width as f32, self.config.height as f32),
+                );
+                self.screen = Screen::Painting(PaintingState {
+                    canvas,
+                    controller,
+                    background_mode: BackgroundMode::Transparent,
+                    tool: Tool::Paint,
+                });
+            }
         }
 
         self.present(output, pixels_per_point, clear_color);
@@ -556,4 +584,4 @@ impl GpuState {
             self.egui_renderer.free_texture(id);
         }
     }
-            }
+    }
